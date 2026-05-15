@@ -30,7 +30,7 @@ The main inputs are:
 - `--nt_label`: non-targeting control label.
 - `--outdir`: output directory.
 
-The `.h5ad` input can be sliced from a larger `.h5ad` file, for example using [`annslicer`](https://github.com/cellarium-ai/annslicer), a low-memory utility for slicing and merging AnnData `.h5ad`/`.zarr` files. :contentReference[oaicite:1]{index=1}
+The `.h5ad` input can be sliced from a larger `.h5ad` file, for example using [`annslicer`](https://github.com/cellarium-ai/annslicer), a low-memory utility for slicing and merging AnnData `.h5ad`/`.zarr` files.
 
 The `pair_csv` should include at least:
 
