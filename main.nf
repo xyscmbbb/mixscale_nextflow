@@ -1,20 +1,5 @@
 nextflow.enable.dsl = 2
 
-// ============================================================
-// Validate required parameters
-// ============================================================
-if (params.h5ad == null) {
-    error "Please provide --h5ad"
-}
-
-if (params.pair_csv == null) {
-    error "Please provide --pair_csv"
-}
-
-if (params.perturb_gene == null) {
-    error "Please provide --perturb_gene"
-}
-
 
 // ============================================================
 // Step 1: Convert h5ad to Seurat object
@@ -209,6 +194,20 @@ process RUN_WMVREGDE {
 // Workflow
 // ============================================================
 workflow {
+
+    // Validate required parameters inside workflow block.
+    // Nextflow 26 does not allow top-level statements mixed with process/workflow declarations.
+    if (params.h5ad == null) {
+        error "Please provide --h5ad"
+    }
+
+    if (params.pair_csv == null) {
+        error "Please provide --pair_csv"
+    }
+
+    if (params.perturb_gene == null) {
+        error "Please provide --perturb_gene"
+    }
 
     h5ad_ch = Channel.fromPath(params.h5ad, checkIfExists: true)
     pair_csv_ch = Channel.fromPath(params.pair_csv, checkIfExists: true)
