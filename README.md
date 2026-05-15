@@ -1,6 +1,6 @@
 # mixscale_nextflow
 
-[Mixscale](https://github.com/satijalab/Mixscale) is an R package for analyzing single-cell Perturb-seq data. It quantifies cell-level perturbation strength and performs weighted differential expression analysis, which can improve statistical power in CRISPRi Perturb-seq datasets. The official Mixscale vignette describes two main steps: calculating Mixscale scores and running scoring-based weighted DE tests. :contentReference[oaicite:0]{index=0}
+[Mixscale](https://github.com/satijalab/Mixscale) is an R package for analyzing single-cell Perturb-seq data. It quantifies cell-level perturbation strength and performs weighted differential expression analysis, which can improve statistical power in CRISPRi Perturb-seq datasets. The official Mixscale vignette describes two main steps: calculating Mixscale scores and running scoring-based weighted DE tests.
 
 For large-scale Perturb-seq datasets, Mixscale can require substantial memory and long runtimes, especially for genome-wide screens with thousands of perturbed genes. This Nextflow workflow wraps the Mixscale analysis into a reproducible, cluster-friendly pipeline. The workflow subsets the full dataset to one perturbed target gene plus non-targeting controls, because each target gene can be analyzed independently. This substantially reduces memory requirements and makes it easy to parallelize across target genes.
 
