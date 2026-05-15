@@ -1,14 +1,44 @@
-# mixscale_nextflow_v6
+# mixscale_nextflow
 
-Three-step Nextflow workflow:
+[Mixscale](https://github.com/satijalab/Mixscale) is an R package for analyzing single-cell Perturb-seq data. It quantifies cell-level perturbation strength and performs weighted differential expression analysis, which can improve statistical power in CRISPRi Perturb-seq datasets. The official Mixscale vignette describes two main steps: calculating Mixscale scores and running scoring-based weighted DE tests. :contentReference[oaicite:0]{index=0}
 
-1. `01_convert_h5ad_to_obj.R`: h5ad -> Seurat object RDS
-2. `02_mixscale_preprocess.R`: Mixscale preprocessing -> Mixscale object RDS
-3. `03_Run_wmvRegDE_scaled_debug.R`: weighted Mixscale DE -> final CSV outputs
+For large-scale Perturb-seq datasets, Mixscale can require substantial memory and long runtimes, especially for genome-wide screens with thousands of perturbed genes. This Nextflow workflow wraps the Mixscale analysis into a reproducible, cluster-friendly pipeline. The workflow subsets the full dataset to one perturbed target gene plus non-targeting controls, because each target gene can be analyzed independently. This substantially reduces memory requirements and makes it easy to parallelize across target genes.
 
-This v5 pipeline keeps your original `03_Run_wmvRegDE_scaled_debug.R` unchanged. Step 3 runs through `bin/03_wrapper_patch_pcols.R`, which creates a temporary patched copy in the Nextflow work directory to avoid the `object 'pcols' not found` error. The original script file is not modified.
+## Workflow overview
 
-Step 3 uses `stdbuf -oL -eL ... | tee step3_wmvregde.log` and `debug true`, so messages from `glm_gp`/R should stream to the terminal and are also saved in the process work directory as `step3_wmvregde.log`.
+The pipeline runs one target gene at a time in three steps:
+
+1. `01_convert_h5ad_to_obj.R`  
+   Converts a sliced `.h5ad` file into a Seurat object RDS.
+
+2. `02_mixscale_preprocess.R`  
+   Runs Mixscale preprocessing and computes Mixscale scores.
+
+3. `03_Run_wmvRegDE_scaled_debug.R`  
+   Runs weighted Mixscale differential expression analysis and writes final CSV outputs.
+
+## Inputs
+
+The main inputs are:
+
+- `--h5ad`: sliced `.h5ad` file for one perturbation plus non-targeting controls.
+- `--pair_csv`: per-cell guide assignment CSV.
+- `--perturb_gene`: target gene to analyze.
+- `--target_gene_col`: column containing the target gene label.
+- `--cell_col`: column containing cell barcodes.
+- `--guide_col`: column containing guide or guide-pair labels.
+- `--nt_label`: non-targeting control label.
+- `--outdir`: output directory.
+
+The `.h5ad` input can be sliced from a larger `.h5ad` file, for example using [`annslicer`](https://github.com/cellarium-ai/annslicer), a low-memory utility for slicing and merging AnnData `.h5ad`/`.zarr` files. :contentReference[oaicite:1]{index=1}
+
+The `pair_csv` should include at least:
+
+| Column | Description |
+|---|---|
+| `cell_col` | Cell barcode / cell ID |
+| `guide_col` | Guide or guide-pair assignment for each cell |
+| `target_gene_col` | Target gene assignment for each cell |
 
 ## Run example
 
@@ -24,23 +54,3 @@ nextflow run main.nf -resume \
   --outdir /home/unix/xuyushan/mixscale/pilot_10/results/ZNHIT6 \
   -ansi-log false \
   -with-trace
-```
-
-## Final outputs
-
-Only these two final files are published to `--outdir`:
-
-```text
-pert_<GENE>_de_res_df.csv
-pert_<GENE>_meta_data.csv
-```
-
-Intermediate RDS files stay in Nextflow work directories.
-
-
-## v6 notes
-
-- Uses `docker.io/xyscmbbb/r-mixscale:1.1.7` by default.
-- No wrapper script is used. Step 3 calls `bin/03_Run_wmvRegDE_scaled_debug.R` directly.
-- The original notebook is not modified; the R scripts contain copied workflow logic.
-- Step 3 uses `stdbuf -oL -eL ... | tee step3_wmvregde.log` so glmGamPoi/glm_gp messages stream during execution.
