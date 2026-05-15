@@ -1,0 +1,14 @@
+work/
+.nextflow/
+.nextflow.log*
+results/
+trace.txt
+timeline.html
+report.html
+flowchart.html
+*.RDS
+*.rds
+*.h5ad
+*.csv
+*.log
+.DS_Store
