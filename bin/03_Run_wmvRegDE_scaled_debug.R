@@ -17,10 +17,23 @@ option_list <- list(
   make_option("--logfc_threshold", type = "double", default = 0),
   make_option("--min_pct", type = "double", default = 0),
   make_option("--min_cells_group", type = "integer", default = 10),
+  make_option("--subsample", type = "character", default = "true",
+              help = "Whether to use subsample=TRUE in glm_gp. Default: true"),
   make_option("--save_mixscale_obj", type = "character", default = "false")
 )
 opt <- parse_args(OptionParser(option_list = option_list))
 stopifnot(!is.null(opt$obj_rds), !is.null(opt$perturb_gene))
+
+to_bool <- function(x) {
+  x <- tolower(as.character(x))
+  if (x %in% c("true", "t", "1", "yes", "y")) return(TRUE)
+  if (x %in% c("false", "f", "0", "no", "n")) return(FALSE)
+  stop("Cannot parse logical value: ", x)
+}
+
+subsample_use <- to_bool(opt$subsample)
+message("[03] glm_gp subsample: ", subsample_use)
+
 save_mixscale_obj <- tolower(opt$save_mixscale_obj) %in% c("true", "t", "1", "yes", "y")
 `%||%` <- function(a, b) if (!is.null(a)) a else b
 
@@ -58,7 +71,8 @@ Run_wmvRegDE_scaled_debug <- function(
     total_ct_labels = "nCount_RNA",
     pseudocount.use = 1,
     base = 2,
-    full.results = FALSE
+    full.results = FALSE,
+    subsample = TRUE
 ) {
     if (!rlang::is_installed("glmGamPoi")) stop("Please install glmGamPoi.")
     if (slot != "counts") stop("The slot must be set to 'counts'.")
@@ -97,9 +111,9 @@ Run_wmvRegDE_scaled_debug <- function(
     extract_results <- function(dat, form, meta) {
         rownames(meta) <- meta$cell_label
         meta <- meta[colnames(dat), , drop = FALSE]
-        fit <- try(glmGamPoi::glm_gp(data = dat, design = form, col_data = meta, size_factors = FALSE, on_disk = FALSE, subsample = TRUE), silent = FALSE)
+        fit <- try(glmGamPoi::glm_gp(data = dat, design = form, col_data = meta, size_factors = FALSE, on_disk = FALSE, subsample = subsample), silent = FALSE)
         if (inherits(fit, "try-error")) {
-            fit <- glmGamPoi::glm_gp(data = as.matrix(dat), design = form, col_data = meta, size_factors = FALSE, on_disk = FALSE, subsample = TRUE)
+            fit <- glmGamPoi::glm_gp(data = as.matrix(dat), design = form, col_data = meta, size_factors = FALSE, on_disk = FALSE, subsample = subsample)
         }
         beta_mat <- as.matrix(fit$Beta)
         pred <- predict(fit, se.fit = TRUE, newdata = diag(ncol(beta_mat)))
@@ -296,7 +310,8 @@ de_res <- Run_wmvRegDE_scaled_debug(
   min.pct = opt$min_pct,
   min.cells.group = opt$min_cells_group,
   verbose = TRUE,
-  split.by = NULL
+  split.by = NULL,
+  subsample = subsample_use
 )
 
 de_res_df <- de_res[[opt$perturb_gene]]

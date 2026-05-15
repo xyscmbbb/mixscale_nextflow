@@ -20,6 +20,7 @@ params.max_de_genes      = 100
 params.logfc_threshold   = 0
 params.min_pct           = 0
 params.min_cells_group   = 10
+params.subsample         = false
 params.seed              = 1
 
 if (params.h5ad == null) {
@@ -164,6 +165,7 @@ process RUN_WMVREGDE_SCALED_DEBUG {
     echo "[STEP 3/3] time: \$(date)"
     echo "[STEP 3/3] workdir: \$(pwd)"
     echo "[STEP 3/3] input: ${mixscale_obj}"
+    echo "[STEP 3/3] subsample: ${params.subsample}"
     echo "============================================================"
 
     stdbuf -oL -eL Rscript --vanilla ${projectDir}/bin/03_Run_wmvRegDE_scaled_debug.R \
@@ -174,6 +176,7 @@ process RUN_WMVREGDE_SCALED_DEBUG {
       --logfc_threshold ${params.logfc_threshold} \
       --min_pct ${params.min_pct} \
       --min_cells_group ${params.min_cells_group} \
+      --subsample ${params.subsample} \
       2>&1 | tee step3_wmvregde.log
 
     echo "============================================================"
@@ -192,3 +195,4 @@ workflow {
     prepped   = MIXSCALE_PREPROCESS(converted.seurat_obj, params.perturb_gene)
     RUN_WMVREGDE_SCALED_DEBUG(prepped.mixscale_obj, params.perturb_gene)
 }
+
