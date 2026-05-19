@@ -1,0 +1,4 @@
+task_id	hash	native_id	name	status	exit	submit	duration	realtime	%cpu	peak_rss	peak_vmem	rchar	wchar
+1	fb/673ce6	26163	CONVERT_H5AD_TO_OBJ (RRP9)	CACHED	0	2026-05-19 15:53:39.115	1m 50s	1m 50s	-	-	-	-	-
+2	8a/ceed3b	37810	MIXSCALE_PREPROCESS (RRP9)	COMPLETED	0	2026-05-19 16:47:56.914	5m 57s	5m 52s	129.8%	64.3 GB	66.3 GB	424.5 MB	1.9 GB
+3	c5/f919d9	44553	RUN_WMVREGDE (RRP9)	COMPLETED	0	2026-05-19 16:53:54.127	46m 47s	46m 47s	166.2%	98.5 GB	100.3 GB	1.9 GB	22.7 MB

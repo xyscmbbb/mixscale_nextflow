@@ -1,11 +1,10 @@
 nextflow.enable.dsl = 2
 
-
 // ============================================================
 // Step 1: Convert h5ad to Seurat object
 // ============================================================
-process CONVERT_H5AD_TO_OBJ {
 
+process CONVERT_H5AD_TO_OBJ {
     tag "${perturb_gene}"
     debug true
 
@@ -67,12 +66,11 @@ process CONVERT_H5AD_TO_OBJ {
     """
 }
 
-
 // ============================================================
 // Step 2: Mixscale preprocessing
 // ============================================================
-process MIXSCALE_PREPROCESS {
 
+process MIXSCALE_PREPROCESS {
     tag "${perturb_gene}"
     debug true
 
@@ -104,6 +102,12 @@ process MIXSCALE_PREPROCESS {
     echo "[STEP 2/3] target_gene_col: ${params.target_gene_col}"
     echo "[STEP 2/3] guide_col: ${params.guide_col}"
     echo "[STEP 2/3] nt_label: ${params.nt_label}"
+    echo "[STEP 2/3] ndims: ${params.ndims}"
+    echo "[STEP 2/3] num_neighbors: ${params.num_neighbors}"
+    echo "[STEP 2/3] chunk_cells: ${params.chunk_cells}"
+    echo "[STEP 2/3] min_de_genes: ${params.min_de_genes}"
+    echo "[STEP 2/3] max_de_genes: ${params.max_de_genes}"
+    echo "[STEP 2/3] logfc_threshold: ${params.logfc_threshold}"
     echo "[STEP 2/3] task.cpus: ${task.cpus}"
     echo "[STEP 2/3] task.memory: ${task.memory}"
     echo "[STEP 2/3] nproc: \$(nproc)"
@@ -114,6 +118,12 @@ process MIXSCALE_PREPROCESS {
       --target_gene_col ${params.target_gene_col} \\
       --guide_col ${params.guide_col} \\
       --nt_label ${params.nt_label} \\
+      --ndims ${params.ndims} \\
+      --num_neighbors ${params.num_neighbors} \\
+      --chunk_cells ${params.chunk_cells} \\
+      --min_de_genes ${params.min_de_genes} \\
+      --max_de_genes ${params.max_de_genes} \\
+      --logfc_threshold ${params.logfc_threshold} \\
       --out_rds pert_${perturb_gene}.mixscale_obj.rds \\
       2>&1 | tee step2_mixscale_preprocess.log
 
@@ -125,12 +135,11 @@ process MIXSCALE_PREPROCESS {
     """
 }
 
-
 // ============================================================
 // Step 3: Weighted Mixscale DE
 // ============================================================
-process RUN_WMVREGDE {
 
+process RUN_WMVREGDE {
     tag "${perturb_gene}"
     debug true
 
@@ -189,14 +198,11 @@ process RUN_WMVREGDE {
     """
 }
 
-
 // ============================================================
 // Workflow
 // ============================================================
-workflow {
 
-    // Validate required parameters inside workflow block.
-    // Nextflow 26 does not allow top-level statements mixed with process/workflow declarations.
+workflow {
     if (params.h5ad == null) {
         error "Please provide --h5ad"
     }
