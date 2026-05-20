@@ -44,7 +44,7 @@ The `pair_csv` should include at least:
 
 ```bash
 nextflow run main.nf -resume \
-  --h5ad pert_ABT1.h5ad \
+  --h5ad pert_RRP9.h5ad \
   --pair_csv NGN2-MN_per_cell_target.csv \
   --perturb_gene RRP9 \
   --target_gene_col target_gene \
