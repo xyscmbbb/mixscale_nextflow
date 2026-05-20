@@ -44,13 +44,17 @@ The `pair_csv` should include at least:
 
 ```bash
 nextflow run main.nf -resume \
-  --h5ad /home/unix/xuyushan/mixscale/pilot_10/shards/pert_ZNHIT6.h5ad \
-  --pair_csv /home/unix/xuyushan/mixscale/pilot_10/VSMC_per_cell_target.csv \
-  --perturb_gene ZNHIT6 \
+  --h5ad pert_ABT1.h5ad \
+  --pair_csv NGN2-MN_per_cell_target.csv \
+  --perturb_gene RRP9 \
   --target_gene_col target_gene \
   --cell_col cell \
   --guide_col pair_key \
   --nt_label ONE_INTERGENIC_SITE \
-  --outdir /home/unix/xuyushan/mixscale/pilot_10/results/ZNHIT6 \
+  --subsample false \
+  --outdir results \
+  --cpus 8 \
+  --memory 120 \
+  --chunk_cells 5000 \
   -ansi-log false \
   -with-trace
