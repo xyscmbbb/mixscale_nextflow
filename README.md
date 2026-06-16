@@ -63,19 +63,30 @@ nextflow run main.nf -resume \
   -with-trace
 ```
 
-## Performance and the step-3 bottleneck
+## Performance and bottlenecks
 
-**Step 3 (weighted DE) dominates the pipeline's runtime and memory.** It fits one
-negative-binomial GLM per gene with `glm_gp`, which is **single-threaded** and, with
+**Step 3 (weighted DE) dominates the pipeline's runtime, and is also a memory peak.**
+It fits one negative-binomial GLM per gene with `glm_gp`, which is **single-threaded**
+and, with
 `on_disk = FALSE`, **materializes a dense genes × cells working matrix** (there is no
 in-memory sparse IRLS path). Cost therefore scales with two axes:
 
-- **Number of genes fitted** — the full transcriptome (~24k genes) by default.
+- **Number of genes fitted** — the full transcriptome by default.
 - **Number of cells** = perturbed + **all non-targeting controls**. The NT pool is
   usually the larger of the two, so it is a first-class driver of both time and memory.
 
 For reference, on RRP9 the genome-wide step-3 fit takes ~10 min / ~30 GiB at 19k cells,
-and ~46 min / ~100 GB at ~69k cells (mostly NT). Steps 1–2 are comparatively cheap.
+and ~46 min / ~100 GB at ~69k cells (mostly NT).
+
+**Step 2 (`MIXSCALE_PREPROCESS`) is also memory-heavy**, though shorter. Its
+`CalcPerturbSig` builds a perturbation-signature matrix whose peak RAM scales with the
+cell count; on the ~69k-cell RRP9 run it reached **~64 GB**. This step is the reason
+the pipeline still needs a large-memory machine even when step 3 is filtered. Its peak
+is bounded by **`--chunk_cells`**, which processes cells in chunks: **lower
+`chunk_cells` lowers peak RAM at the cost of runtime, higher speeds it up but raises
+peak** (e.g. `--chunk_cells 5000` gave ~64 GB / ~6 min; a smaller chunk size trades
+that for a longer wall time). Tune `chunk_cells` down if step 2 is the memory-limiting
+step on your machine.
 
 ### What helps: pre-filter the gene set
 
