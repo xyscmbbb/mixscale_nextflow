@@ -46,23 +46,48 @@ save_mixscale_obj <- tolower(opt$save_mixscale_obj) %in% c("true", "t", "1", "ye
 message("[03] Reading Mixscale object: ", opt$obj_rds)
 obj <- readRDS(opt$obj_rds)
 
-FoldChange_new <- function(obj, cells.1, cells.2, mean.fxn, fc.name, features) {
-  fc <- Seurat::FoldChange(
-    object = obj,
-    cells.1 = cells.1,
-    cells.2 = cells.2,
-    features = features,
-    mean.fxn = mean.fxn,
-    fc.name = fc.name
+# Per-gene log2FC + DE-filter flags, computed in a single pass over the already
+# cell-subset sparse counts matrix.
+#
+# The previous FoldChange_new() called Seurat::FoldChange() (which internally
+# subsets object[features, cells.1/2] and computes rowSums / rowSums(x>0)) and
+# then re-subset the FULL object matrix two MORE times to recompute min.cell.*.
+# For ~60k features that is four full-feature subsets plus two `m > 0` sparse
+# allocations per call. Here we instead take two column slices of the small,
+# already-subset count matrix and derive everything from rowSums + the stored
+# nonzero counts (`@i` via tabulate), so expressing-cell counts are exact
+# integers rather than rounded pct * n. Identical avg_log2FC, lower peak RAM.
+compute_fc_stats <- function(counts_mat, p_cols, nt_cols,
+                             pseudocount.use = 1, base = 2,
+                             logfc.threshold = 0, min.pct = 0,
+                             min.cells.group = 10) {
+  feats <- rownames(counts_mat)
+  nfeat <- length(feats)
+
+  P <- counts_mat[, p_cols, drop = FALSE]
+  N <- counts_mat[, nt_cols, drop = FALSE]
+  if (!inherits(P, "dgCMatrix")) P <- as(P, "dgCMatrix")
+  if (!inherits(N, "dgCMatrix")) N <- as(N, "dgCMatrix")
+
+  # Cells expressing each gene = stored nonzeros per row (counts are > 0 where
+  # stored). tabulate over the row indices avoids materialising `x > 0`.
+  n_expr_P <- tabulate(P@i + 1L, nfeat)
+  n_expr_N <- tabulate(N@i + 1L, nfeat)
+
+  mean_P <- log((Matrix::rowSums(P) + pseudocount.use) / ncol(P), base = base)
+  mean_N <- log((Matrix::rowSums(N) + pseudocount.use) / ncol(N), base = base)
+  avg_log2FC <- mean_P - mean_N
+
+  pass_pct  <- (n_expr_P / length(p_cols)  >= min.pct) |
+               (n_expr_N / length(nt_cols) >= min.pct)
+  pass_cell <- (n_expr_P >= min.cells.group) | (n_expr_N >= min.cells.group)
+
+  data.frame(
+    avg_log2FC = avg_log2FC,
+    status     = (abs(avg_log2FC) >= logfc.threshold) & pass_pct & pass_cell,
+    status2    = pass_pct & pass_cell,
+    row.names  = feats
   )
-
-  m1 <- obj[features, cells.1, drop = FALSE]
-  m2 <- obj[features, cells.2, drop = FALSE]
-
-  fc$min.cell.1 <- Matrix::rowSums(m1 > 0)
-  fc$min.cell.2 <- Matrix::rowSums(m2 > 0)
-
-  fc
 }
 
 Run_wmvRegDE_scaled_debug <- function(
@@ -314,6 +339,9 @@ Run_wmvRegDE_scaled_debug <- function(
 
     count_data_sparse <- GetAssayData(object, assay = assay, layer = "counts")[, idx_c, drop = FALSE]
 
+    # count_data_sparse columns are in mat_all row order, so cell-type / NT vs
+    # perturbed selections are plain column indices -- no re-match to the full
+    # object and no second copy of the genome-wide counts matrix.
     fc_list <- list()
 
     for (idx_i in seq_along(celltype_list)) {
@@ -323,44 +351,26 @@ Run_wmvRegDE_scaled_debug <- function(
         levels(mat_all$cell_type)[idx_i]
       }
 
-      idx_NT_ct <- match(
-        mat_all$cell_label[mat_all$cell_type == ct & mat_all$gene == nt.class.name],
-        colnames(object)
-      )
+      ct_mask <- mat_all$cell_type == ct
+      nt_cols <- which(ct_mask & mat_all$gene == nt.class.name)
+      p_cols  <- which(ct_mask & mat_all$gene != nt.class.name)
 
-      idx_P_ct <- match(
-        mat_all$cell_label[mat_all$cell_type == ct & mat_all$gene != nt.class.name],
-        colnames(object)
-      )
-
-      idx_NT_ct <- idx_NT_ct[!is.na(idx_NT_ct)]
-      idx_P_ct <- idx_P_ct[!is.na(idx_P_ct)]
-
-      if (length(idx_NT_ct) == 0 || length(idx_P_ct) == 0) {
+      if (length(nt_cols) == 0 || length(p_cols) == 0) {
         warning("[03] Skipping FoldChange for ", PRTB, ", cell type ", ct,
                 ": missing perturbed or NT cells.")
         next
       }
 
-      fc <- FoldChange_new(
-        obj = GetAssayData(object, assay = assay, layer = "counts"),
-        cells.1 = colnames(object)[idx_P_ct],
-        cells.2 = colnames(object)[idx_NT_ct],
-        mean.fxn = function(x) {
-          log((Matrix::rowSums(x) + pseudocount.use) / NCOL(x), base = base)
-        },
-        fc.name = "avg_log2FC",
-        features = rownames(object)
+      fc_list[[ct]] <- compute_fc_stats(
+        counts_mat      = count_data_sparse,
+        p_cols          = p_cols,
+        nt_cols         = nt_cols,
+        pseudocount.use = pseudocount.use,
+        base            = base,
+        logfc.threshold = logfc.threshold,
+        min.pct         = min.pct,
+        min.cells.group = min.cells.group
       )
-
-      fc$status <- abs(fc$avg_log2FC) >= logfc.threshold &
-        (fc$pct.1 >= min.pct | fc$pct.2 >= min.pct) &
-        (fc$min.cell.1 >= min.cells.group | fc$min.cell.2 >= min.cells.group)
-
-      fc$status2 <- (fc$pct.1 >= min.pct | fc$pct.2 >= min.pct) &
-        (fc$min.cell.1 >= min.cells.group | fc$min.cell.2 >= min.cells.group)
-
-      fc_list[[ct]] <- fc
     }
 
     if (length(fc_list) == 0) {
@@ -401,7 +411,9 @@ Run_wmvRegDE_scaled_debug <- function(
       }
     }
 
-    idx_for_DE <- which(apply(idx_list, 1, any))
+    # Row-wise OR across cell types, vectorised (apply(., 1, any) is ~60k slow
+    # one-row calls; Reduce over the columns is a handful of vector ORs).
+    idx_for_DE <- which(Reduce(`|`, idx_list))
     idx_PRTB_id <- which(rownames(object) %in% PRTB)
     idx_for_DE <- unique(c(idx_PRTB_id, idx_for_DE))
 
@@ -459,6 +471,7 @@ Run_wmvRegDE_scaled_debug <- function(
       idx_loo_m <- which(rownames(object) %in% loo_targets)
       idx_std_m <- setdiff(idx_for_DE, idx_loo_m)
 
+      # Main genome-wide fit.
       if (length(idx_std_m) > 0) {
         res <- extract_results(
           count_data_sparse[idx_std_m, , drop = FALSE],
@@ -469,7 +482,13 @@ Run_wmvRegDE_scaled_debug <- function(
         res <- data.frame(gene_ID = character(0))
       }
 
-      for (g_target in loo_targets) {
+      # Leave-one-out targets are single genes (cheap) but each uses a different
+      # weight column, so they stay serial. Accumulate in a list and rbind once
+      # instead of growing `res` quadratically inside the loop.
+      loo_res <- vector("list", length(loo_targets))
+
+      for (li in seq_along(loo_targets)) {
+        g_target <- loo_targets[li]
         idx_target <- which(rownames(count_data_sparse) == g_target)
 
         if (length(idx_target) == 0) {
@@ -495,14 +514,14 @@ Run_wmvRegDE_scaled_debug <- function(
           next
         }
 
-        tmp_res <- extract_results(
+        loo_res[[li]] <- extract_results(
           count_data_sparse[idx_target, , drop = FALSE],
           form_call,
           mat_loo
         )
-
-        res <- rbind(res, tmp_res)
       }
+
+      res <- do.call(rbind, c(list(res), loo_res))
 
     } else {
       res <- extract_results(

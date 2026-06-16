@@ -52,9 +52,23 @@ nextflow run main.nf -resume \
   --guide_col pair_key \
   --nt_label ONE_INTERGENIC_SITE \
   --subsample false \
+  --min_pct 0.02 \
+  --logfc_threshold 0 \
+  --min_cells_group 10 \
   --outdir results \
   --cpus 8 \
   --memory 120 \
   --chunk_cells 5000 \
   -ansi-log false \
   -with-trace
+```
+
+Step 3 (weighted DE) fits one negative-binomial GLM per gene with `glm_gp`, which
+is single-threaded; runtime and memory scale with the number of genes fitted and the
+number of cells (perturbed + non-targeting). To bound the cost, `--min_pct` and
+`--logfc_threshold` pre-filter the gene set fed to `glm_gp`: a gene is fitted only if
+it is expressed in at least `min_pct` of either the perturbed or NT cells (and in at
+least `--min_cells_group` cells). The defaults (`min_pct = 0`, `logfc_threshold = 0`)
+reproduce the original unfiltered behaviour. Note that `p_adj_bh` is corrected over
+the number of genes actually fitted, so adjusted p-values from a filtered run are not
+directly comparable to an unfiltered run.

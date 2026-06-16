@@ -174,6 +174,8 @@ process RUN_WMVREGDE {
     echo "[STEP 3/3] target_gene_col: ${params.target_gene_col}"
     echo "[STEP 3/3] nt_label: ${params.nt_label}"
     echo "[STEP 3/3] subsample: ${params.subsample}"
+    echo "[STEP 3/3] min_pct: ${params.min_pct}"
+    echo "[STEP 3/3] min_cells_group: ${params.min_cells_group}"
     echo "[STEP 3/3] task.cpus: ${task.cpus}"
     echo "[STEP 3/3] task.memory: ${task.memory}"
     echo "[STEP 3/3] nproc: \$(nproc)"
@@ -188,6 +190,9 @@ process RUN_WMVREGDE {
       --target_gene_col ${params.target_gene_col} \\
       --nt_label ${params.nt_label} \\
       --subsample ${params.subsample} \\
+      --logfc_threshold ${params.logfc_threshold} \\
+      --min_pct ${params.min_pct} \\
+      --min_cells_group ${params.min_cells_group} \\
       2>&1 | tee step3_wmvregde.log
 
     echo "============================================================"
