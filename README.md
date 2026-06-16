@@ -63,12 +63,47 @@ nextflow run main.nf -resume \
   -with-trace
 ```
 
-Step 3 (weighted DE) fits one negative-binomial GLM per gene with `glm_gp`, which
-is single-threaded; runtime and memory scale with the number of genes fitted and the
-number of cells (perturbed + non-targeting). To bound the cost, `--min_pct` and
-`--logfc_threshold` pre-filter the gene set fed to `glm_gp`: a gene is fitted only if
-it is expressed in at least `min_pct` of either the perturbed or NT cells (and in at
-least `--min_cells_group` cells). The defaults (`min_pct = 0`, `logfc_threshold = 0`)
-reproduce the original unfiltered behaviour. Note that `p_adj_bh` is corrected over
-the number of genes actually fitted, so adjusted p-values from a filtered run are not
-directly comparable to an unfiltered run.
+## Performance and the step-3 bottleneck
+
+**Step 3 (weighted DE) dominates the pipeline's runtime and memory.** It fits one
+negative-binomial GLM per gene with `glm_gp`, which is **single-threaded** and, with
+`on_disk = FALSE`, **materializes a dense genes × cells working matrix** (there is no
+in-memory sparse IRLS path). Cost therefore scales with two axes:
+
+- **Number of genes fitted** — the full transcriptome (~24k genes) by default.
+- **Number of cells** = perturbed + **all non-targeting controls**. The NT pool is
+  usually the larger of the two, so it is a first-class driver of both time and memory.
+
+For reference, on RRP9 the genome-wide step-3 fit takes ~10 min / ~30 GiB at 19k cells,
+and ~46 min / ~100 GB at ~69k cells (mostly NT). Steps 1–2 are comparatively cheap.
+
+### What helps: pre-filter the gene set
+
+The dominant lever is **fitting fewer genes**. `--min_pct` and `--logfc_threshold`
+prune the gene set fed to `glm_gp`: a gene is fitted only if it is expressed in at
+least `min_pct` of either the perturbed or NT cells, passes the `logfc_threshold`, and
+is seen in at least `--min_cells_group` cells. On the RRP9 benchmark, raising
+`min_pct` to `0.02` cut the fitted set from ~24k to ~900 genes, giving roughly a **12×
+speedup and 4× lower memory** on the serial path. Defaults (`min_pct = 0`,
+`logfc_threshold = 0`) reproduce the original unfiltered behaviour.
+
+> **Caveat:** `p_adj_bh` is BH-corrected over the number of genes *actually fitted*, so
+> adjusted p-values from a filtered run are **not** directly comparable to an unfiltered
+> run (the smaller denominator inflates significance, and genes pruned by `min_pct` are
+> never tested). For comparable statistics, fit the filtered set but apply BH correction
+> over the full gene universe, or report the raw `p_weight` and adjust yourself.
+
+### What does *not* help
+
+- **Multi-threading `glm_gp`.** It has no internal parallelism, and fitting gene
+  chunks in forked workers benchmarked as a **regression** — slower and more memory
+  (each fork densifies its own chunk simultaneously, plus BLAS oversubscription) and
+  numerically divergent from the serial fit. The pipeline is intentionally serial.
+- **`--subsample true`.** This only subsamples `glm_gp`'s overdispersion estimation,
+  which is not the cost driver, so it gives **no measurable speed or memory benefit**
+  while perturbing the weighted p-values (it shifted ~⅓ of DEG calls on the benchmark).
+  Leave `--subsample false`.
+
+For very large NT pools, the most direct way to lower the step-3 memory ceiling is to
+**cap the number of NT cells** before the fit (smaller dense matrix on both axes),
+since neither threading nor subsampling addresses it.
