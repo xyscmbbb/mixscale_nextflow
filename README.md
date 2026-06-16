@@ -96,17 +96,6 @@ numerical core is **compiled C++** — it links `Rcpp` / `RcppArmadillo` and shi
 are the *inputs* (how many genes and cells reach the fit), which is exactly why gene
 pre-filtering and NT-pool size are the levers that matter.
 
-**Alternatives?** Other packages fit the same negative-binomial GLM for counts —
-[DESeq2](https://bioconductor.org/packages/DESeq2/) and
-[edgeR](https://bioconductor.org/packages/edgeR/) (the classic bulk RNA-seq NB-GLM
-engines), [NEBULA](https://cran.r-project.org/package=nebula) (a fast NB mixed model
-aimed at single cell), or base `MASS::glm.nb`. None is an obvious drop-in speedup here:
-the bulk-oriented tools are generally slower and heavier across tens of thousands of
-single cells, `glm.nb` is much slower (its outer loop is R), and all of them push their
-hot numerics into compiled C/C++/Fortran too — so the per-gene NB fit cost is intrinsic,
-not a glmGamPoi-specific inefficiency. Swapping engines would also mean reimplementing
-Mixscale's weighting around a different API for little expected gain.
-
 **Step 2 (`MIXSCALE_PREPROCESS`) is also memory-heavy**, though shorter. Its
 `CalcPerturbSig` builds a perturbation-signature matrix whose peak RAM scales with the
 cell count; on the ~69k-cell RRP9 run it reached **~64 GB**. This step is the reason
