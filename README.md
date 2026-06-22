@@ -71,7 +71,7 @@ and, with
 `on_disk = FALSE`, **materializes a dense genes × cells working matrix** (there is no
 in-memory sparse IRLS path). Cost therefore scales with two axes:
 
-- **Number of genes fitted** — the full transcriptome by default.
+- **Number of genes fitted** — the expressed genes in the full transcriptome. It is controlled by `--min_pct` and `--logfc_threshold` (plus `--min_cells_group`), applied as a Seurat-FindMarkers-style pre-filter before `glm_gp` (per-gene n_expr/ncol >= `min.pct` and |avg_log2FC| >= `logfc.threshold` → a keep mask). Defaults are `min_pct=0`, `logfc=0` → fit every gene expressed in that perturbation's cell subset.
 - **Number of cells** = perturbed + **all non-targeting controls**. The NT pool is
   usually the larger of the two, so it is a first-class driver of both time and memory.
 
