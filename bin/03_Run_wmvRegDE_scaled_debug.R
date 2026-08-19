@@ -21,7 +21,14 @@ option_list <- list(
   make_option("--min_cells_group", type = "integer", default = 10),
   make_option("--subsample", type = "character", default = "false",
               help = "Whether to use subsample=TRUE in glm_gp. Default: false"),
-  make_option("--save_mixscale_obj", type = "character", default = "false")
+  make_option("--save_mixscale_obj", type = "character", default = "false"),
+  make_option("--fc_norm", type = "character", default = "log.norm",
+              help = paste("How avg_log2FC is computed: 'log.norm' (default) uses the",
+                           "library-size-normalised expression, matching Seurat's",
+                           "LogNormalize convention; 'raw' reproduces upstream Mixscale's",
+                           "un-normalised counts behaviour. See NOTE in compute_fc_stats().")),
+  make_option("--scale_factor", type = "double", default = 1e4,
+              help = "Scale factor used by NormalizeData() in step 02. Default: 1e4")
 )
 
 opt <- parse_args(OptionParser(option_list = option_list))
@@ -57,7 +64,37 @@ obj <- readRDS(opt$obj_rds)
 # already-subset count matrix and derive everything from rowSums + the stored
 # nonzero counts (`@i` via tabulate), so expressing-cell counts are exact
 # integers rather than rounded pct * n. Identical avg_log2FC, lower peak RAM.
+# NOTE on avg_log2FC (changed deliberately; diverges from upstream Mixscale).
+#
+# Upstream Mixscale (satijalab/Mixscale, R/scoring_de.R) computes
+#     mean.fxn = function(x) log((rowSums(x) + pseudocount.use) / NCOL(x), base)
+# on the RAW COUNTS layer. That has two consequences we do not want:
+#
+#   (a) No library-size normalisation. The DE *test* already controls for depth
+#       (log_ct is a covariate in the glm_gp design, hence size_factors = FALSE),
+#       but the fold change never sees it, so avg_log2FC tracks sequencing depth.
+#   (b) The pseudocount is added to the SUM, so the term is rowMeans + 1/N. With
+#       unequal group sizes a gene absent from both groups gets
+#       log2(N_nt / N_pert) instead of 0 -- e.g. +5.7 for 319 perturbed vs 16,297
+#       NT cells. The bias is largest for lowly expressed genes and for
+#       perturbations with few cells, which is exactly where it does most damage.
+#
+# Upstream's own get_fc() (R/get_fold_change.R) uses the correct convention,
+#     log(mean(x) + pseudocount.use)  /  log(mean(expm1(x)) + pseudocount.use)
+# and exposes norm.method = 'log.norm'; Run_wmvRegDE() simply never calls it.
+#
+# We therefore default to fc_norm = "log.norm":
+#     avg_log2FC = log2(mean(counts / nCount_RNA * scale.factor) + pseudocount)
+# which is identical to Seurat's FoldChange() on the LogNormalize "data" layer,
+# because expm1(log1p(y)) == y. Step 02 slims the object to the counts layer, so
+# we reconstruct the normalisation here from counts + nCount_RNA rather than
+# carrying a second matrix through the pipeline.
+#
+# Pass --fc_norm raw to reproduce the previous (upstream) behaviour exactly.
 compute_fc_stats <- function(counts_mat, p_cols, nt_cols,
+                             total_counts = NULL,
+                             norm.method = "log.norm",
+                             scale.factor = 1e4,
                              pseudocount.use = 1, base = 2,
                              logfc.threshold = 0, min.pct = 0,
                              min.cells.group = 10) {
@@ -74,8 +111,33 @@ compute_fc_stats <- function(counts_mat, p_cols, nt_cols,
   n_expr_P <- tabulate(P@i + 1L, nfeat)
   n_expr_N <- tabulate(N@i + 1L, nfeat)
 
-  mean_P <- log((Matrix::rowSums(P) + pseudocount.use) / ncol(P), base = base)
-  mean_N <- log((Matrix::rowSums(N) + pseudocount.use) / ncol(N), base = base)
+  # n_expr_* are computed above from the RAW counts; normalisation cannot change
+  # which entries are non-zero, so the min.pct / min.cells filters are unaffected.
+  if (identical(norm.method, "log.norm")) {
+    if (is.null(total_counts)) {
+      stop("compute_fc_stats(): norm.method='log.norm' requires total_counts.")
+    }
+    tp <- as.numeric(total_counts[p_cols])
+    tn <- as.numeric(total_counts[nt_cols])
+    bad_p <- !is.finite(tp) | tp <= 0
+    bad_n <- !is.finite(tn) | tn <= 0
+    if (any(bad_p)) tp[bad_p] <- Matrix::colSums(P)[bad_p]
+    if (any(bad_n)) tn[bad_n] <- Matrix::colSums(N)[bad_n]
+    tp[!is.finite(tp) | tp <= 0] <- 1
+    tn[!is.finite(tn) | tn <= 0] <- 1
+
+    # expm1(LogNormalize(counts)) == counts / nCount_RNA * scale.factor, exactly.
+    P <- P %*% Matrix::Diagonal(x = scale.factor / tp)
+    N <- N %*% Matrix::Diagonal(x = scale.factor / tn)
+
+    mean_P <- log(Matrix::rowSums(P) / length(p_cols)  + pseudocount.use, base = base)
+    mean_N <- log(Matrix::rowSums(N) / length(nt_cols) + pseudocount.use, base = base)
+  } else if (identical(norm.method, "raw")) {
+    mean_P <- log((Matrix::rowSums(P) + pseudocount.use) / ncol(P), base = base)
+    mean_N <- log((Matrix::rowSums(N) + pseudocount.use) / ncol(N), base = base)
+  } else {
+    stop("compute_fc_stats(): fc_norm must be 'log.norm' or 'raw', got: ", norm.method)
+  }
   avg_log2FC <- mean_P - mean_N
 
   pass_pct  <- (n_expr_P / length(p_cols)  >= min.pct) |
@@ -103,6 +165,8 @@ Run_wmvRegDE_scaled_debug <- function(
     min.pct = 0.1,
     min.cells.group = 10,
     total_ct_labels = "nCount_RNA",
+    fc.norm.method = "log.norm",
+    scale.factor = 1e4,
     pseudocount.use = 1,
     base = 2,
     full.results = FALSE,
@@ -365,6 +429,9 @@ Run_wmvRegDE_scaled_debug <- function(
         counts_mat      = count_data_sparse,
         p_cols          = p_cols,
         nt_cols         = nt_cols,
+        total_counts    = mat_all$nCount_RNA,
+        norm.method     = fc.norm.method,
+        scale.factor    = scale.factor,
         pseudocount.use = pseudocount.use,
         base            = base,
         logfc.threshold = logfc.threshold,
@@ -567,6 +634,8 @@ Run_wmvRegDE_scaled_debug <- function(
   all_res
 }
 
+message("[03] avg_log2FC norm.method: ", opt$fc_norm,
+        " (scale.factor = ", opt$scale_factor, ")")
 message("[03] Running weighted Mixscale DE only for: ", opt$perturb_gene)
 
 de_res <- Run_wmvRegDE_scaled_debug(
@@ -574,6 +643,8 @@ de_res <- Run_wmvRegDE_scaled_debug(
   assay = "RNA",
   slot = "counts",
   total_ct_labels = "nCount_RNA",
+  fc.norm.method = opt$fc_norm,
+  scale.factor = opt$scale_factor,
   labels = opt$target_gene_col,
   nt.class.name = opt$nt_label,
   PRTB_list = opt$perturb_gene,
