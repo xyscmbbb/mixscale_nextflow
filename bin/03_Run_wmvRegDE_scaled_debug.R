@@ -254,7 +254,12 @@ Run_wmvRegDE_scaled_debug <- function(
     )
   }
 
-  extract_results <- function(dat, form, meta) {
+  # `gene_idx` selects rows of `dat` to fit. Passing indices rather than
+  # `dat[gene_idx, ]` matters at scale: with min_pct = 0 the selection is ~99.7%
+  # of rows, so the subset is a near-complete second copy of the counts matrix.
+  # The collapsed solver slices its gene chunks out of the transpose anyway, so
+  # it can take the index directly and never materialise the subset.
+  extract_results <- function(dat, form, meta, gene_idx = NULL) {
     rownames(meta) <- meta$cell_label
     meta <- meta[colnames(dat), , drop = FALSE]
 
@@ -262,7 +267,7 @@ Run_wmvRegDE_scaled_debug <- function(
       # Build the model matrix through glm_gp's own handler so the columns,
       # their order and their names are identical to the stock path.
       mm <- glmGamPoi:::handle_design_parameter(form, dat, meta, NULL)$model_matrix
-      cf <- collapsed_glm_gp(dat, mm, verbose = TRUE,
+      cf <- collapsed_glm_gp(dat, mm, gene_idx = gene_idx, verbose = TRUE,
                              threads = max(1L, as.integer(opt$threads)),
                              solver = Sys.getenv("MIXSCALE_SOLVER", "chol"))
       beta_mat <- cf$Beta
@@ -276,6 +281,8 @@ Run_wmvRegDE_scaled_debug <- function(
       res_df$gene_ID <- rownames(res_df)
       return(res_df)
     }
+
+    if (!is.null(gene_idx)) dat <- dat[gene_idx, , drop = FALSE]
 
     fit <- try(
       glmGamPoi::glm_gp(
@@ -444,7 +451,19 @@ Run_wmvRegDE_scaled_debug <- function(
       idx_c <- idx_c[keep]
     }
 
-    count_data_sparse <- GetAssayData(object, assay = assay, layer = "counts")[, idx_c, drop = FALSE]
+    # Reordering the counts matrix to metadata order costs a full extra copy of
+    # it -- 17 GB at 300k NT, and it is pure permutation, no data change. The GLM
+    # is a sum over cells, so cell order is immaterial: reorder the metadata to
+    # the object's column order instead. When the metadata covers every column
+    # (the pipeline's case, since step 1 subsets the object to PRTB + NT) the
+    # result is the identity and no subsetting happens at all.
+    ord <- order(idx_c)
+    mat_all <- mat_all[ord, , drop = FALSE]
+    idx_c <- idx_c[ord]
+
+    count_data_sparse <- GetAssayData(object, assay = assay, layer = "counts")
+    if (!identical(idx_c, seq_len(ncol(count_data_sparse))))
+      count_data_sparse <- count_data_sparse[, idx_c, drop = FALSE]
 
     # count_data_sparse columns are in mat_all row order, so cell-type / NT vs
     # perturbed selections are plain column indices -- no re-match to the full
@@ -583,11 +602,8 @@ Run_wmvRegDE_scaled_debug <- function(
 
       # Main genome-wide fit.
       if (length(idx_std_m) > 0) {
-        res <- extract_results(
-          count_data_sparse[idx_std_m, , drop = FALSE],
-          form_call,
-          mat_all
-        )
+        res <- extract_results(count_data_sparse, form_call, mat_all,
+                               gene_idx = idx_std_m)
       } else {
         res <- data.frame(gene_ID = character(0))
       }
@@ -634,11 +650,8 @@ Run_wmvRegDE_scaled_debug <- function(
       res <- do.call(rbind, c(list(res), loo_res))
 
     } else {
-      res <- extract_results(
-        count_data_sparse[idx_for_DE, , drop = FALSE],
-        form_call,
-        mat_all
-      )
+      res <- extract_results(count_data_sparse, form_call, mat_all,
+                             gene_idx = idx_for_DE)
     }
 
     fc_mat$gene_ID <- rownames(fc_mat)

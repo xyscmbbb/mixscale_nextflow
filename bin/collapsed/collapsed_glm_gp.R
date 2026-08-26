@@ -55,14 +55,20 @@
 # is global, so beta pass 2 cannot start until every gene's disp_est exists).
 # No IRLS arithmetic is repeated, so results are unchanged.
 
-collapsed_glm_gp <- function(Y, design, verbose = TRUE,
+collapsed_glm_gp <- function(Y, design, gene_idx = NULL, verbose = TRUE,
                              do_cox_reid_adjustment = TRUE,
                              max_iter_od = 200,
                              gene_chunk = NULL, chunk_budget_gb = 0.5,
                              threads = 1L, solver = c("qr", "chol")) {
   solver_id <- if (match.arg(solver) == "chol") 1L else 0L
   stopifnot(inherits(Y, "dgCMatrix"))
-  n <- ncol(Y); ng <- nrow(Y); p <- ncol(design)
+  # `gene_idx` selects which rows of Y to fit. Taking an index rather than a
+  # pre-subset matrix keeps the caller from having to materialise one: at
+  # min_pct = 0 the selection is ~99.7% of rows, so the subset would be a second
+  # near-complete copy of the counts. Chunks are slices of `gsel`, so nothing
+  # downstream changes -- output row k is gene gsel[k] either way.
+  gsel <- if (is.null(gene_idx)) seq_len(nrow(Y)) else as.integer(gene_idx)
+  n <- ncol(Y); ng <- length(gsel); p <- ncol(design)
   stopifnot(nrow(design) == n)
   tick <- function(msg, t0) if (verbose)
     message(sprintf("[collapsed] %-22s %6.1f s", msg, as.numeric(difftime(Sys.time(), t0, units = "secs"))))
@@ -77,10 +83,11 @@ collapsed_glm_gp <- function(Y, design, verbose = TRUE,
   f <- as.numeric(Matrix::rowSums(M))
   grp0 <- as.integer(grp - 1L)
   # gene-major copy: chunking is then a contiguous column slice (cheap) and the
-  # stats kernel gets one gene per thread with no write races.  Y is dropped so
-  # this is a move, not a doubling.
-  gnames <- rownames(Y)
-  Yt <- Matrix::t(Y); rm(Y); gc(FALSE)
+  # stats kernel gets one gene per thread with no write races. Y belongs to the
+  # caller now, so this is a genuine doubling of the counts while both live --
+  # the largest remaining term in step 3's peak.
+  gnames <- rownames(Y)[gsel]
+  Yt <- Matrix::t(Y); gc(FALSE)
   if (verbose) message(sprintf("[collapsed] %d cells -> %d design rows (%.1fx)", n, R, n / R))
 
   if (is.null(gene_chunk))
@@ -99,7 +106,7 @@ collapsed_glm_gp <- function(Y, design, verbose = TRUE,
   for (ci in seq_along(chunks)) {
     idx <- chunks[[ci]]
     ta <- Sys.time()
-    Ytc <- Yt[, idx, drop = FALSE]
+    Ytc <- Yt[, gsel[idx], drop = FALSE]
     st <- chunk_stats_cpp(Ytc@p, Ytc@i, Ytc@x, grp0, length(idx), R, threads)
     t_stats <- t_stats + as.numeric(difftime(Sys.time(), ta, units = "secs"))
 
@@ -168,7 +175,7 @@ collapsed_glm_gp <- function(Y, design, verbose = TRUE,
   dev <- numeric(ng); iters <- numeric(ng)
   for (ci in seq_along(chunks)) {
     idx <- chunks[[ci]]
-    Ytc <- Yt[, idx, drop = FALSE]
+    Ytc <- Yt[, gsel[idx], drop = FALSE]
     stb <- chunk_stats_cpp(Ytc@p, Ytc@i, Ytc@x, grp0, length(idx), R, threads)
     S  <- stb$S
     r2 <- fit_gp_weighted_s_cpp(S, Xc, f, disp_latest[idx],
