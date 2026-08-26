@@ -8,6 +8,24 @@ suppressPackageStartupMessages({
   library(RANN)
 })
 
+# Resolve the helper next to this script regardless of how it was invoked.
+.self <- sub("^--file=", "", grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE))
+source(file.path(dirname(.self), "mixscale_de_genes.R"))
+source(file.path(dirname(.self), "mixscale_loo_patch.R"))
+
+# stage timer -- the log needs to show where step 2's time goes so the cost can
+# be projected to a larger NT pool.
+.stage_t0 <- Sys.time()
+.stage_nm <- NULL
+stage <- function(name) {
+  if (!is.null(.stage_nm))
+    message(sprintf("[02][time] %-34s %7.1f s", .stage_nm,
+                    as.numeric(difftime(Sys.time(), .stage_t0, units = "secs"))))
+  .stage_nm <<- name
+  .stage_t0 <<- Sys.time()
+}
+
+
 option_list <- list(
   make_option("--obj_rds", type = "character"),
   make_option("--target_gene_col", type = "character", default = "target_gene"),
@@ -255,6 +273,7 @@ message("[02] logfc_threshold: ", opt$logfc_threshold)
 
 DefaultAssay(obj) <- "RNA"
 
+stage("normalize/HVG/scale/PCA")
 message("[02] NormalizeData / FindVariableFeatures / ScaleData / RunPCA")
 obj <- NormalizeData(obj, verbose = FALSE)
 obj <- FindVariableFeatures(obj, verbose = FALSE)
@@ -273,6 +292,33 @@ obj <- DietSeurat(
 DefaultAssay(obj) <- "RNA"
 gc()
 
+# RunMixscale reads the PRTB assay only at its body line 259, immediately subset
+# to de.genes, and de.genes is computed from the RNA assay -- it never touches
+# PRTB. Selecting those genes up front lets CalcPerturbSig build a PRTB matrix of
+# ~max_de_genes rows instead of all ~60k, which is where step 2's time and memory
+# were going. The list is handed back to RunMixscale so it does not recompute it.
+stage("DE gene selection (wilcox)")
+message("[02] Precomputing DE genes (RNA assay) to restrict CalcPerturbSig")
+de_genes_list <- mixscale_de_genes(
+  object = obj,
+  labels = opt$target_gene_col,
+  nt.class.name = opt$nt_label,
+  de.assay = "RNA",
+  logfc.threshold = opt$logfc_threshold,
+  fine.mode = fine_mode,
+  fine.mode.labels = if (fine_mode) opt$guide_col else NULL,
+  verbose = TRUE
+)
+prtb_features <- unique(unlist(de_genes_list, use.names = FALSE))
+message("[02] DE genes across all targets: ", length(prtb_features),
+        " (of ", nrow(obj[["RNA"]]), " -> ",
+        round(nrow(obj[["RNA"]]) / max(1, length(prtb_features))), "x fewer PRTB rows)")
+
+if (length(prtb_features) == 0) {
+  stop("[02] No DE genes selected for any target; cannot build a PRTB assay.")
+}
+
+stage("CalcPerturbSig (kNN + PRTB)")
 message("[02] CalcPerturbSig_chunked_for_Mixscale")
 obj <- CalcPerturbSig_chunked_for_Mixscale(
   object = obj,
@@ -283,7 +329,7 @@ obj <- CalcPerturbSig_chunked_for_Mixscale(
   reduction = "pca",
   ndims = opt$ndims,
   num.neighbors = opt$num_neighbors,
-  features = rownames(obj[["RNA"]]),
+  features = prtb_features,
   new.assay.name = "PRTB",
   chunk.cells = opt$chunk_cells,
   split.by = NULL,
@@ -293,6 +339,8 @@ obj <- CalcPerturbSig_chunked_for_Mixscale(
 
 DefaultAssay(obj) <- "PRTB"
 
+stage("RunMixscale (scores + LOO)")
+patch_runmixscale_loo()
 message("[02] RunMixscale")
 
 if (fine_mode) {
@@ -306,6 +354,7 @@ if (fine_mode) {
     logfc.threshold = opt$logfc_threshold,
     de.assay = "RNA",
     max.de.genes = opt$max_de_genes,
+    DE.gene = de_genes_list,
     new.class.name = "mixscale_score",
     fine.mode = TRUE,
     fine.mode.labels = opt$guide_col,
@@ -322,6 +371,7 @@ if (fine_mode) {
     logfc.threshold = opt$logfc_threshold,
     de.assay = "RNA",
     max.de.genes = opt$max_de_genes,
+    DE.gene = de_genes_list,
     new.class.name = "mixscale_score",
     fine.mode = FALSE,
     verbose = TRUE
@@ -354,6 +404,7 @@ DefaultAssay(obj_slim) <- "RNA"
 
 gc()
 
+stage("saveRDS")
 message("[02] Saving slim object: ", opt$out_rds)
 saveRDS(
   obj_slim,
@@ -364,3 +415,4 @@ saveRDS(
 message("[02] Wrote slim object: ", opt$out_rds)
 message("[02] Final assays: ", paste(Assays(obj_slim), collapse = ", "))
 message("[02] Final RNA layers: ", paste(Layers(obj_slim[["RNA"]]), collapse = ", "))
+stage(NULL)

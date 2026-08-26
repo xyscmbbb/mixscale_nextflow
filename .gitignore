@@ -12,3 +12,4 @@ flowchart.html
 *.csv
 *.log
 .DS_Store
+*.bak

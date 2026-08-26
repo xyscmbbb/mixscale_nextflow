@@ -22,11 +22,24 @@ option_list <- list(
   make_option("--subsample", type = "character", default = "false",
               help = "Whether to use subsample=TRUE in glm_gp. Default: false"),
   make_option("--save_mixscale_obj", type = "character", default = "false"),
+  make_option("--collapsed", type = "character", default = "false",
+              help = paste("Fit with the collapsed Gamma-Poisson solver instead of stock",
+                           "glm_gp. NT cells carry weight == 0 exactly, so they differ only",
+                           "in log_ct = log1p(nCount) and cells sharing a design row share",
+                           "mu; every per-cell sum in the fit therefore reduces to a",
+                           "per-group sum. The reduction is exact. Stock glm_gp's dense",
+                           "n_genes x n_cells Mu becomes n_genes x n_groups, which is what",
+                           "makes multi-million-cell fits possible at all. Default: false")),
   make_option("--fc_norm", type = "character", default = "log.norm",
               help = paste("How avg_log2FC is computed: 'log.norm' (default) uses the",
                            "library-size-normalised expression, matching Seurat's",
                            "LogNormalize convention; 'raw' reproduces upstream Mixscale's",
                            "un-normalised counts behaviour. See NOTE in compute_fc_stats().")),
+  make_option("--threads", type = "integer", default = 1,
+              help = paste("Worker threads for the --collapsed solver only (OpenMP over",
+                           "genes in the IRLS/SE passes, forked workers for the",
+                           "overdispersion MLE). Genes are independent, so this does not",
+                           "change results. Ignored on the stock glm_gp path. Default: 1")),
   make_option("--scale_factor", type = "double", default = 1e4,
               help = "Scale factor used by NormalizeData() in step 02. Default: 1e4")
 )
@@ -43,6 +56,17 @@ to_bool <- function(x) {
 
 subsample_use <- to_bool(opt$subsample)
 message("[03] glm_gp subsample: ", subsample_use)
+
+use_collapsed <- tolower(opt$collapsed) %in% c("true", "t", "yes", "1")
+if (use_collapsed) {
+  .self3 <- sub("^--file=", "", grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE))
+  source(file.path(dirname(.self3), "collapsed", "load_collapsed.R"))
+  load_collapsed_glm_gp(file.path(dirname(.self3), "collapsed"))
+  if (isTRUE(subsample_use)) {
+    stop("[03] --collapsed does not implement glm_gp's subsample path; use --subsample false.")
+  }
+}
+message("[03] collapsed solver: ", use_collapsed)
 
 save_mixscale_obj <- tolower(opt$save_mixscale_obj) %in% c("true", "t", "1", "yes", "y")
 
@@ -233,6 +257,25 @@ Run_wmvRegDE_scaled_debug <- function(
   extract_results <- function(dat, form, meta) {
     rownames(meta) <- meta$cell_label
     meta <- meta[colnames(dat), , drop = FALSE]
+
+    if (use_collapsed) {
+      # Build the model matrix through glm_gp's own handler so the columns,
+      # their order and their names are identical to the stock path.
+      mm <- glmGamPoi:::handle_design_parameter(form, dat, meta, NULL)$model_matrix
+      cf <- collapsed_glm_gp(dat, mm, verbose = TRUE,
+                             threads = max(1L, as.integer(opt$threads)),
+                             solver = Sys.getenv("MIXSCALE_SOLVER", "chol"))
+      beta_mat <- cf$Beta
+      se_mat <- cf$se
+      se_mat[!is.finite(se_mat) | se_mat == 0] <- NA_real_
+      z2 <- (beta_mat / se_mat)^2
+      p_mat <- pchisq(z2, df = 1, lower.tail = FALSE)
+      res_df <- cbind(as.data.frame(beta_mat), as.data.frame(p_mat))
+      colnames(res_df) <- c(paste0("beta_", colnames(beta_mat)),
+                            paste0("p_", colnames(beta_mat)))
+      res_df$gene_ID <- rownames(res_df)
+      return(res_df)
+    }
 
     fit <- try(
       glmGamPoi::glm_gp(
