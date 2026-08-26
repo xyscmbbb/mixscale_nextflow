@@ -169,6 +169,20 @@ CalcPerturbSig_chunked_for_Mixscale <- function(
       neighbor_chunks <- vector("list", length(cell_chunks))
     }
 
+    # RANN::nn2 rebuilds a kd-tree over `data` on every call, so querying once
+    # per chunk rebuilt the tree over all NT cells length(cell_chunks) times
+    # (102 times at 305k cells / chunk.cells = 3000). One call for the whole
+    # split returns the same neighbours -- same data, same query order, same k
+    # -- and the index matrix is only n_cells x k integers.
+    message("[CalcPerturbSig_chunked] kNN for all ", length(cells_use),
+            " cells in one nn2 call")
+    nn_all <- RANN::nn2(
+      data = nt_emb,
+      query = all_emb,
+      k = num.neighbors
+    )$nn.idx
+    rownames(nn_all) <- cells_use
+
     for (i in seq_along(cell_chunks)) {
       query_cells <- cell_chunks[[i]]
 
@@ -177,11 +191,7 @@ CalcPerturbSig_chunked_for_Mixscale <- function(
         " | cells = ", length(query_cells)
       )
 
-      nn <- RANN::nn2(
-        data = nt_emb,
-        query = all_emb[query_cells, , drop = FALSE],
-        k = num.neighbors
-      )$nn.idx
+      nn <- nn_all[query_cells, , drop = FALSE]
 
       W <- Matrix::sparseMatrix(
         i = as.vector(nn),
@@ -219,7 +229,7 @@ CalcPerturbSig_chunked_for_Mixscale <- function(
       rm(neighbor_chunks)
     }
 
-    rm(nt_expr_linear, nt_emb, all_emb, cell_chunks)
+    rm(nt_expr_linear, nt_emb, all_emb, cell_chunks, nn_all)
     gc()
   }
 
@@ -290,6 +300,18 @@ obj <- DietSeurat(
 )
 
 DefaultAssay(obj) <- "RNA"
+
+# scale.data fed RunPCA and nothing after it. It is dense -- 2000 variable
+# features x n_cells x 8 B, i.e. ~4.6 GB at 305k cells -- so drop it before
+# CalcPerturbSig allocates the PRTB matrix.
+try({
+  sd_dim <- dim(SeuratObject::LayerData(obj[["RNA"]], layer = "scale.data"))
+  if (!is.null(sd_dim) && prod(sd_dim) > 0) {
+    message(sprintf("[02] dropping scale.data (%d x %d, %.2f GB)",
+                    sd_dim[1], sd_dim[2], prod(sd_dim) * 8 / 1024^3))
+    SeuratObject::LayerData(obj[["RNA"]], layer = "scale.data") <- NULL
+  }
+}, silent = TRUE)
 gc()
 
 # RunMixscale reads the PRTB assay only at its body line 259, immediately subset
