@@ -260,8 +260,13 @@ Run_wmvRegDE_scaled_debug <- function(
   # The collapsed solver slices its gene chunks out of the transpose anyway, so
   # it can take the index directly and never materialise the subset.
   extract_results <- function(dat, form, meta, gene_idx = NULL) {
+    # mat_all is built in the object's column order (see the idx_c block below),
+    # so this realignment is normally the identity. Doing it anyway copies a
+    # ~100-column data frame -- one column per Mixscale DE gene -- and matches
+    # every cell name, once per leave-one-out fit. Check first.
     rownames(meta) <- meta$cell_label
-    meta <- meta[colnames(dat), , drop = FALSE]
+    if (!identical(rownames(meta), colnames(dat)))
+      meta <- meta[colnames(dat), , drop = FALSE]
 
     if (use_collapsed) {
       # Build the model matrix through glm_gp's own handler so the columns,
@@ -613,9 +618,17 @@ Run_wmvRegDE_scaled_debug <- function(
       # instead of growing `res` quadratically inside the loop.
       loo_res <- vector("list", length(loo_targets))
 
+      # Pull every leave-one-out gene out of the counts ONCE. count_data_sparse
+      # is column-major (dgCMatrix), so subsetting a row scans all nonzeros --
+      # taking one row costs the same as taking a hundred. Done inside the loop
+      # that is ~5 s per fit at 450k cells, ~500 s over 100 fits, and it was the
+      # single largest component of step 3. The extracted block is ~100 genes,
+      # a few tens of MB, and row-subsetting it afterwards is free.
+      loo_mat <- count_data_sparse[idx_loo_m, , drop = FALSE]
+
       for (li in seq_along(loo_targets)) {
         g_target <- loo_targets[li]
-        idx_target <- which(rownames(count_data_sparse) == g_target)
+        idx_target <- which(rownames(loo_mat) == g_target)
 
         if (length(idx_target) == 0) {
           next
@@ -641,7 +654,7 @@ Run_wmvRegDE_scaled_debug <- function(
         }
 
         loo_res[[li]] <- extract_results(
-          count_data_sparse[idx_target, , drop = FALSE],
+          loo_mat[idx_target, , drop = FALSE],
           form_call,
           mat_loo
         )

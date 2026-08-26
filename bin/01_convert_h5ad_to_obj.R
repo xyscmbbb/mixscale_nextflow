@@ -39,30 +39,97 @@ print(reticulate::py_config())
 
 message("[01] Reading h5ad: ", opt$h5ad)
 anndata <- import("anndata", convert = FALSE)
-scipy <- import("scipy.sparse", convert = FALSE)
-ad <- anndata$read_h5ad(opt$h5ad)
-X <- ad$X
+np      <- import("numpy",   convert = FALSE)
+bi      <- import_builtins(convert = FALSE)
 
-if (py_to_r(scipy$issparse(X))) {
-  message("[01] adata.X is sparse; converting scipy sparse matrix to R sparse Matrix.")
-  X_coo <- X$tocoo()
-  shape <- py_to_r(X_coo$shape)
-  n_row <- as.integer(shape[[1]])
-  n_col <- as.integer(shape[[2]])
-  i <- as.integer(py_to_r(X_coo$row)) + 1L
-  j <- as.integer(py_to_r(X_coo$col)) + 1L
-  x <- as.numeric(py_to_r(X_coo$data))
-  mat <- sparseMatrix(i = i, j = j, x = x, dims = c(n_row, n_col))
-} else {
-  message("[01][WARN] adata.X is dense; converting to sparse Matrix in R.")
-  mat <- Matrix(py_to_r(X), sparse = TRUE)
-}
-
+# obs/var only -- backed="r" leaves X on disk so it is never materialised twice.
+ad <- anndata$read_h5ad(opt$h5ad, backed = "r")
 cell_names <- py_to_r(ad$obs_names$to_list())
 gene_names <- py_to_r(ad$var_names$to_list())
-rownames(mat) <- cell_names
-colnames(mat) <- gene_names
-counts <- t(mat)
+obs        <- py_to_r(ad$obs)
+
+# Read one HDF5 dataset into a preallocated R vector in slices, so python never
+# holds the whole array alongside the R copy.
+h5_read_vec <- function(ds, n, integer_out, chunk = 5e7) {
+  out <- if (integer_out) integer(n) else numeric(n)
+  a <- 0
+  while (a < n) {
+    b <- min(a + chunk, n)
+    v <- py_to_r(np$asarray(ds$`__getitem__`(bi$slice(bi$int(a), bi$int(b)))))
+    out[(a + 1):b] <- v
+    a <- b
+  }
+  out
+}
+
+h5py <- import("h5py", convert = FALSE)
+fh   <- h5py$File(opt$h5ad, "r")
+Xg   <- fh[["X"]]
+enc  <- tryCatch(as.character(py_to_r(Xg$attrs[["encoding-type"]])), error = function(e) "")
+
+if (enc %in% c("csr_matrix", "csc_matrix")) {
+  # An h5ad stores X as cells x genes. Either sparse encoding is just the triple
+  # (indptr, indices, data), which maps straight onto a dgCMatrix's (p, i, x) --
+  # so the matrix can be built from the HDF5 datasets with no scipy COO, no
+  # dgTMatrix intermediate and no 1-based index vectors.
+  #
+  #   CSR(cells x genes) is BIT-IDENTICAL to CSC(genes x cells), i.e. exactly the
+  #   counts matrix Seurat wants -- the transpose is free.
+  #   CSC(cells x genes) gives the cells x genes dgCMatrix, and still needs one
+  #   real t(). Exporting shards as CSR avoids that copy entirely.
+  shape  <- py_to_r(Xg$attrs[["shape"]])
+  n_cell <- as.integer(shape[[1]])
+  n_gene <- as.integer(shape[[2]])
+  nnz    <- as.numeric(py_to_r(Xg[["indices"]]$shape)[[1]])
+  message(sprintf("[01] X is %s, %d cells x %d genes, nnz = %.0f (%.0f/cell)",
+                  enc, n_cell, n_gene, nnz, nnz / n_cell))
+  if (nnz >= 2147483647)
+    stop("[01] nnz = ", format(nnz, scientific = FALSE), " exceeds the dgCMatrix ",
+         "limit of 2^31-1. Shard the h5ad into fewer cells.")
+
+  message("[01] reading indices ...")
+  i_vec <- h5_read_vec(Xg[["indices"]], nnz, TRUE)
+  p_vec <- as.integer(py_to_r(np$asarray(Xg[["indptr"]])))
+  message("[01] reading data ...")
+  x_vec <- h5_read_vec(Xg[["data"]], nnz, FALSE)
+  fh$close()
+
+  # new() shares these vectors rather than copying them; the validity check is
+  # what guarantees the stored indices were sorted within each slice.
+  dm <- if (enc == "csr_matrix") c(n_gene, n_cell) else c(n_cell, n_gene)
+  dn <- if (enc == "csr_matrix") list(gene_names, cell_names)
+        else                     list(cell_names, gene_names)
+  counts <- new("dgCMatrix", i = i_vec, p = p_vec, x = x_vec, Dim = dm, Dimnames = dn)
+  rm(i_vec, p_vec, x_vec); gc(FALSE)
+
+  if (enc == "csc_matrix") {
+    message("[01] transposing to genes x cells (one copy; export shards as CSR to skip this)")
+    counts <- Matrix::t(counts)
+    counts <- as(counts, "CsparseMatrix")
+    gc(FALSE)
+  }
+} else {
+  message("[01][WARN] X is not sparse (encoding-type '", enc, "'); ",
+          "falling back to the scipy COO path (much heavier).")
+  fh$close()
+  scipy <- import("scipy.sparse", convert = FALSE)
+  ad2 <- anndata$read_h5ad(opt$h5ad)
+  X <- ad2$X
+  if (py_to_r(scipy$issparse(X))) {
+    X_coo <- X$tocoo()
+    shape <- py_to_r(X_coo$shape)
+    mat <- sparseMatrix(i = as.integer(py_to_r(X_coo$row)) + 1L,
+                        j = as.integer(py_to_r(X_coo$col)) + 1L,
+                        x = as.numeric(py_to_r(X_coo$data)),
+                        dims = c(as.integer(shape[[1]]), as.integer(shape[[2]])))
+  } else {
+    mat <- Matrix(py_to_r(X), sparse = TRUE)
+  }
+  rownames(mat) <- cell_names
+  colnames(mat) <- gene_names
+  counts <- t(mat)
+  rm(mat); gc(FALSE)
+}
 
 if (!is.na(opt$max_features) && opt$max_features > 0 && nrow(counts) > opt$max_features) {
   message("[01] Keeping first ", opt$max_features, " features out of ", nrow(counts), ".")
@@ -73,7 +140,6 @@ rownames(counts) <- gsub("_", "-", rownames(counts))
 rownames(counts) <- make.unique(rownames(counts))
 colnames(counts) <- make.unique(colnames(counts))
 
-obs <- py_to_r(ad$obs)
 rownames(obs) <- make.unique(cell_names)
 obs <- obs[colnames(counts), , drop = FALSE]
 
@@ -109,8 +175,12 @@ if (subset_to_gene) {
   keep_cells <- obs[[opt$target_gene_col]] %in% c(opt$perturb_gene, opt$nt_label)
   message("[01] Subsetting cells to ", opt$perturb_gene, " + ", opt$nt_label, ": ", sum(keep_cells), " / ", nrow(obs))
   if (sum(keep_cells) == 0) stop("[01] No cells remain after subsetting. Check --perturb_gene, --target_gene_col, and --nt_label.")
-  counts <- counts[, keep_cells, drop = FALSE]
-  obs <- obs[keep_cells, , drop = FALSE]
+  if (!all(keep_cells)) {
+    counts <- counts[, keep_cells, drop = FALSE]
+    obs <- obs[keep_cells, , drop = FALSE]
+  } else {
+    message("[01] all cells kept; skipping the subset copy")
+  }
 }
 
 obj <- CreateSeuratObject(counts = counts, meta.data = obs)

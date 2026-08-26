@@ -74,13 +74,36 @@ collapsed_glm_gp <- function(Y, design, gene_idx = NULL, verbose = TRUE,
     message(sprintf("[collapsed] %-22s %6.1f s", msg, as.numeric(difftime(Sys.time(), t0, units = "secs"))))
 
   # ---- 1. group identical design rows -------------------------------------
+  # This block runs once per fit, and step 3 does ~100 leave-one-out fits after
+  # the genome-wide one. Each LOO fit touches a single gene but re-groups every
+  # cell, so at 455k cells the grouping dominated the whole step: 10.2 s per LOO
+  # fit against 0.7 s of solver work.
+  #
+  # The old route pasted each design row into a string and matched on it, which
+  # is ~n string allocations plus two hash passes. Sorting the rows numerically
+  # and marking the boundaries is the same partition for a fraction of the cost.
+  # Group ids are renumbered back to first-appearance order afterwards, so `grp`
+  # is identical to what match(key, unique(key)) produced -- group order sets the
+  # summation order in the kernels, and keeping it identical keeps the floating
+  # point identical too.
   t0 <- Sys.time()
-  key <- do.call(paste, c(asplit(design, 2), sep = "\r"))
-  grp <- match(key, unique(key))
+  if (n == 1L) {
+    grp <- 1L
+  } else {
+    o <- do.call(order, c(asplit(design, 2), list(method = "radix")))
+    brk <- c(TRUE, rowSums(design[o[-1L], , drop = FALSE] !=
+                           design[o[-n], , drop = FALSE]) > 0)
+    gs <- integer(n); gs[o] <- cumsum(brk)          # ids in sorted order
+    # renumber sorted ids by where each group first appears in the original order
+    remap <- integer(max(gs))
+    remap[order(match(seq_len(max(gs)), gs))] <- seq_len(max(gs))
+    grp <- remap[gs]
+  }
   R <- max(grp)
   Xc <- design[match(seq_len(R), grp), , drop = FALSE]
-  M <- Matrix::sparseMatrix(i = grp, j = seq_len(n), x = 1, dims = c(R, n))
-  f <- as.numeric(Matrix::rowSums(M))
+  # group sizes: tabulate is O(n) into an R-vector; the old route built an
+  # n-nonzero sparse indicator matrix and row-summed it.
+  f <- as.numeric(tabulate(grp, R))
   grp0 <- as.integer(grp - 1L)
   # gene-major copy: chunking is then a contiguous column slice (cheap) and the
   # stats kernel gets one gene per thread with no write races. Y belongs to the
