@@ -8,8 +8,8 @@ process CONVERT_H5AD_TO_OBJ {
     tag "${perturb_gene}"
     debug true
 
-    cpus params.cpus
-    memory params.memory
+    cpus   params.cpus_step1 ?: params.cpus
+    memory params.mem_step1  ?: params.memory
 
     input:
     path h5ad
@@ -74,8 +74,8 @@ process MIXSCALE_PREPROCESS {
     tag "${perturb_gene}"
     debug true
 
-    cpus params.cpus
-    memory params.memory
+    cpus   params.cpus_step2 ?: params.cpus
+    memory params.mem_step2  ?: params.memory
 
     input:
     tuple val(perturb_gene), path(seurat_obj)
@@ -143,8 +143,8 @@ process RUN_WMVREGDE {
     tag "${perturb_gene}"
     debug true
 
-    cpus params.cpus
-    memory params.memory
+    cpus   params.cpus_step3 ?: params.cpus
+    memory params.mem_step3  ?: params.memory
 
     publishDir "${params.outdir}", mode: "copy", overwrite: true
 
