@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# 1.1.10: precompile the collapsed Gamma-Poisson solver, and make the conda
+# toolchain reachable.
+#
+# Two defects this fixes, both invisible in benchmarking because every bench
+# invocation bind-mounts a prebuilt sourceCpp cache from the host:
+#
+# 1. Step 3 compiles bin/collapsed/*.cpp at run time, and this image's conda R
+#    calls its compiler by the triplet name x86_64-conda-linux-gnu-c++. That
+#    binary exists, in /opt/miniconda3/envs/mixscale/bin, but that directory is
+#    not on the default PATH -- so on a clean VM step 3 dies with
+#      sh: 1: x86_64-conda-linux-gnu-c++: not found
+#    after steps 1 and 2 have already run.
+#
+# 2. Even with a working compiler that build is ~15 s per job. Across a
+#    genome-wide screen (5,000 targets) that is roughly 21 hours of billed
+#    compute spent recompiling identical source.
+#
+# PATH is APPENDED, never prepended: this directory also contains R, Rscript,
+# make, python and python3, and prepending would shadow the /usr/local/bin/Rscript
+# shim the pipeline is invoked through. Appending leaves python resolving to the
+# base conda env, which has no anndata -- hence the explicit RETICULATE_PYTHON.
+FROM docker.io/xyscmbbb/r-mixscale:1.1.9
+
+ENV PATH="${PATH}:/opt/miniconda3/envs/mixscale/bin" \
+    RETICULATE_PYTHON=/opt/miniconda3/envs/mixscale/bin/python \
+    MIXSCALE_COLLAPSED_SRC=/opt/mixscale_collapsed \
+    MIXSCALE_CPP_CACHE=/opt/mixscale_cpp
+
+# sourceCpp's cache key includes the source PATH, not only its contents, so the
+# cache built here is reused only if the job compiles from this same directory.
+# That is what MIXSCALE_COLLAPSED_SRC tells load_collapsed.R to do -- and it does
+# so only when these files still md5-match the checked-out branch, so editing a
+# kernel falls back to compiling the edited one rather than silently using this.
+COPY gp_weighted.cpp gp_overdisp_w.cpp /opt/mixscale_collapsed/
+
+# World-writable: sourceCpp writes token.rds and prunes the cache even on a hit,
+# and a job may not run as the user that built the image.
+RUN mkdir -p "$MIXSCALE_CPP_CACHE" \
+ && Rscript -e 'library(Rcpp); \
+      for (f in c("gp_weighted.cpp","gp_overdisp_w.cpp")) \
+        sourceCpp(file.path(Sys.getenv("MIXSCALE_COLLAPSED_SRC"), f), \
+                  cacheDir = Sys.getenv("MIXSCALE_CPP_CACHE"), env = globalenv()); \
+      stopifnot(exists("fit_gp_weighted_cpp"), exists("gp_se_weighted_cpp")); \
+      cat("collapsed kernels compiled OK\n")' \
+ && chmod -R a+rwX "$MIXSCALE_CPP_CACHE" "$MIXSCALE_COLLAPSED_SRC" \
+ && test -n "$(find "$MIXSCALE_CPP_CACHE" -name '*.so' -print -quit)"
