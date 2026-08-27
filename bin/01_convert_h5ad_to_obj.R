@@ -7,6 +7,11 @@ suppressPackageStartupMessages({
   library(Seurat)
 })
 
+.self <- tryCatch(normalizePath(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE)[1])),
+                  error = function(e) "01_convert_h5ad_to_obj.R")
+source(file.path(dirname(.self), "counts_stats.R"))
+source(file.path(dirname(.self), "rds_io.R"))
+
 option_list <- list(
   make_option("--h5ad", type = "character"),
   make_option("--pair_csv", type = "character"),
@@ -37,6 +42,17 @@ message("[01] RETICULATE_PYTHON: ", Sys.getenv("RETICULATE_PYTHON"))
 message("[01] reticulate Python config:")
 print(reticulate::py_config())
 
+# Per-stage wall clock. At 305,110 cells step 1 is 892 s end to end and the
+# stages are wildly uneven (an HDF5 slice read, an O(nnz) build, and a gzip of a
+# 17 GB object), so a single total says nothing about what to attack.
+.t0 <- Sys.time(); .tprev <- .t0
+tick01 <- function(what) {
+  now <- Sys.time()
+  message(sprintf("[01][time] %-28s %7.1f s  (total %7.1f s)", what,
+                  as.numeric(difftime(now, .tprev, units = "secs")),
+                  as.numeric(difftime(now, .t0, units = "secs"))))
+  .tprev <<- now
+}
 message("[01] Reading h5ad: ", opt$h5ad)
 anndata <- import("anndata", convert = FALSE)
 np      <- import("numpy",   convert = FALSE)
@@ -151,6 +167,7 @@ if (!file.exists(opt$pair_csv)) {
   stop("[01] pair_csv does not exist: ", opt$pair_csv)
 }
 
+tick01("read h5ad -> dgCMatrix")
 message("[01] Reading pair CSV: ", opt$pair_csv)
 pair_df <- read.csv(opt$pair_csv, row.names = 1, check.names = FALSE)
 
@@ -183,10 +200,33 @@ if (subset_to_gene) {
   }
 }
 
-obj <- CreateSeuratObject(counts = counts, meta.data = obs)
+# CreateSeuratObject calls CalcN, which builds colSums(counts > 0) as a full
+# lgCMatrix just to count nonzeros -- 28.77 of the 44.24 GiB the call costs at
+# nnz = 1.43e9. Both statistics are computed off the (p, x) slots instead and
+# handed in through meta.data, which is where CalcN would have put them. When
+# the h5ad's obs already carries a column, the stock path overwrites CalcN's
+# value with it, so it is left alone here too.
+if (!"nCount_RNA" %in% colnames(obs))   obs$nCount_RNA   <- n_counts_per_cell(counts)
+if (!"nFeature_RNA" %in% colnames(obs)) obs$nFeature_RNA <- n_features_per_cell(counts)
+
+assay <- CreateAssay5Object(counts = counts)
+rm(counts); gc(FALSE)
+
+.op <- options(Seurat.object.assay.calcn = FALSE)
+obj <- CreateSeuratObject(assay, assay = "RNA", meta.data = obs)
+options(.op)
+rm(assay); gc(FALSE)
+
+# CalcN's two columns sit directly after orig.ident; keep that order so the
+# metadata is column-for-column what the stock path produced.
+.front <- intersect(c("orig.ident", "nCount_RNA", "nFeature_RNA"), colnames(obj@meta.data))
+obj@meta.data <- obj@meta.data[, c(.front, setdiff(colnames(obj@meta.data), .front)),
+                               drop = FALSE]
+tick01("build Seurat object")
 message("[01] Seurat object: ", nrow(obj), " genes x ", ncol(obj), " cells")
 message("[01] Metadata columns include: ", paste(colnames(obj@meta.data), collapse = ", "))
 message("[01] Saving: ", opt$out_rds)
-saveRDS(obj, opt$out_rds)
+save_rds_fast(obj, opt$out_rds)
+tick01("saveRDS")
 message("[01] Wrote: ", opt$out_rds)
 message("[01] Finished at: ", Sys.time())

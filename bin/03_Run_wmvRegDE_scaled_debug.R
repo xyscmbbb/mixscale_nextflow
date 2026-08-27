@@ -115,25 +115,62 @@ obj <- readRDS(opt$obj_rds)
 # carrying a second matrix through the pipeline.
 #
 # Pass --fc_norm raw to reproduce the previous (upstream) behaviour exactly.
+# A column subset followed by rowSums is a sparse matrix-vector product. The
+# subset only zeroes the columns that were not selected and the Diagonal only
+# rescales the ones that were, and a weight vector that is zero outside `cols`
+# already says both:
+#
+#   rowSums(m[, cols, drop = FALSE] %*% Matrix::Diagonal(x = w))  ==  m %*% v
+#
+# with v[cols] <- w. That allocates one length-ncell weight vector and one
+# length-ngene result instead of two matrix-sized copies -- up to 4 x 16 GB at
+# 305,110 cells, which is the bulk of step 3's peak. Verified BIT-identical at
+# CM scale for both the NT and the perturbed group (max|diff| 0, 0 differing
+# elements, and the log2 term identical). A blocked accumulation is NOT
+# bit-identical (max|diff| 4.4e-9): it changes the order of the summation,
+# whereas the matvec keeps Matrix's own column-by-column order.
+row_sums_scaled <- function(m, cols, w) {
+  v <- numeric(ncol(m))
+  v[cols] <- as.numeric(w)
+  as.numeric(m %*% v)
+}
+
+# Nonzeros per row over a subset of columns, without subsetting. A dgCMatrix
+# column j stores its row indices at @i[(@p[j]+1):@p[j+1]], so the selected
+# columns' entries are gathered directly and tabulated. Counting is exact
+# integer arithmetic, so how the columns are grouped cannot change the result;
+# the grouping only bounds the largest index vector held at once.
+n_expr_cols <- function(m, cols, chunk = 2e7) {
+  p   <- m@p
+  len <- p[cols + 1L] - p[cols]
+  out <- integer(nrow(m))
+  a <- 1L; n <- length(cols)
+  while (a <= n) {
+    cs <- cumsum(as.numeric(len[a:n]))
+    b  <- a + max(1L, sum(cs <= chunk)) - 1L
+    idx <- sequence(len[a:b], from = p[cols[a:b]] + 1L)
+    out <- out + tabulate(m@i[idx] + 1L, nrow(m))
+    rm(idx)
+    a <- b + 1L
+  }
+  out
+}
+
 compute_fc_stats <- function(counts_mat, p_cols, nt_cols,
                              total_counts = NULL,
                              norm.method = "log.norm",
                              scale.factor = 1e4,
                              pseudocount.use = 1, base = 2,
                              logfc.threshold = 0, min.pct = 0,
-                             min.cells.group = 10) {
-  feats <- rownames(counts_mat)
+                             min.cells.group = 10,
+                             feats = NULL) {
+  if (is.null(feats)) feats <- rownames(counts_mat)
   nfeat <- length(feats)
 
-  P <- counts_mat[, p_cols, drop = FALSE]
-  N <- counts_mat[, nt_cols, drop = FALSE]
-  if (!inherits(P, "dgCMatrix")) P <- as(P, "dgCMatrix")
-  if (!inherits(N, "dgCMatrix")) N <- as(N, "dgCMatrix")
-
   # Cells expressing each gene = stored nonzeros per row (counts are > 0 where
-  # stored). tabulate over the row indices avoids materialising `x > 0`.
-  n_expr_P <- tabulate(P@i + 1L, nfeat)
-  n_expr_N <- tabulate(N@i + 1L, nfeat)
+  # stored), read off the (p, i) slots so no column subset is ever built.
+  n_expr_P <- n_expr_cols(counts_mat, p_cols)
+  n_expr_N <- n_expr_cols(counts_mat, nt_cols)
 
   # n_expr_* are computed above from the RAW counts; normalisation cannot change
   # which entries are non-zero, so the min.pct / min.cells filters are unaffected.
@@ -145,20 +182,25 @@ compute_fc_stats <- function(counts_mat, p_cols, nt_cols,
     tn <- as.numeric(total_counts[nt_cols])
     bad_p <- !is.finite(tp) | tp <= 0
     bad_n <- !is.finite(tn) | tn <= 0
-    if (any(bad_p)) tp[bad_p] <- Matrix::colSums(P)[bad_p]
-    if (any(bad_n)) tn[bad_n] <- Matrix::colSums(N)[bad_n]
+    # Only the offending columns are summed; colSums over the full P/N was only
+    # ever read at these positions.
+    if (any(bad_p))
+      tp[bad_p] <- Matrix::colSums(counts_mat[, p_cols[bad_p], drop = FALSE])
+    if (any(bad_n))
+      tn[bad_n] <- Matrix::colSums(counts_mat[, nt_cols[bad_n], drop = FALSE])
     tp[!is.finite(tp) | tp <= 0] <- 1
     tn[!is.finite(tn) | tn <= 0] <- 1
 
     # expm1(LogNormalize(counts)) == counts / nCount_RNA * scale.factor, exactly.
-    P <- P %*% Matrix::Diagonal(x = scale.factor / tp)
-    N <- N %*% Matrix::Diagonal(x = scale.factor / tn)
-
-    mean_P <- log(Matrix::rowSums(P) / length(p_cols)  + pseudocount.use, base = base)
-    mean_N <- log(Matrix::rowSums(N) / length(nt_cols) + pseudocount.use, base = base)
+    mean_P <- log(row_sums_scaled(counts_mat, p_cols,  scale.factor / tp) /
+                    length(p_cols)  + pseudocount.use, base = base)
+    mean_N <- log(row_sums_scaled(counts_mat, nt_cols, scale.factor / tn) /
+                    length(nt_cols) + pseudocount.use, base = base)
   } else if (identical(norm.method, "raw")) {
-    mean_P <- log((Matrix::rowSums(P) + pseudocount.use) / ncol(P), base = base)
-    mean_N <- log((Matrix::rowSums(N) + pseudocount.use) / ncol(N), base = base)
+    mean_P <- log((row_sums_scaled(counts_mat, p_cols,  rep(1, length(p_cols))) +
+                     pseudocount.use) / length(p_cols),  base = base)
+    mean_N <- log((row_sums_scaled(counts_mat, nt_cols, rep(1, length(nt_cols))) +
+                     pseudocount.use) / length(nt_cols), base = base)
   } else {
     stop("compute_fc_stats(): fc_norm must be 'log.norm' or 'raw', got: ", norm.method)
   }
@@ -259,20 +301,27 @@ Run_wmvRegDE_scaled_debug <- function(
   # of rows, so the subset is a near-complete second copy of the counts matrix.
   # The collapsed solver slices its gene chunks out of the transpose anyway, so
   # it can take the index directly and never materialise the subset.
-  extract_results <- function(dat, form, meta, gene_idx = NULL) {
+  # dat_genes / dat_cells carry the dimnames that `dat` deliberately does not.
+  # They default to dat's own, so the small leave-one-out blocks (which are named)
+  # can be passed straight through.
+  extract_results <- function(dat, form, meta, gene_idx = NULL,
+                              dat_genes = NULL, dat_cells = NULL) {
+    if (is.null(dat_genes)) dat_genes <- rownames(dat)
+    if (is.null(dat_cells)) dat_cells <- colnames(dat)
     # mat_all is built in the object's column order (see the idx_c block below),
     # so this realignment is normally the identity. Doing it anyway copies a
     # ~100-column data frame -- one column per Mixscale DE gene -- and matches
     # every cell name, once per leave-one-out fit. Check first.
     rownames(meta) <- meta$cell_label
-    if (!identical(rownames(meta), colnames(dat)))
-      meta <- meta[colnames(dat), , drop = FALSE]
+    if (!identical(rownames(meta), dat_cells))
+      meta <- meta[dat_cells, , drop = FALSE]
 
     if (use_collapsed) {
       # Build the model matrix through glm_gp's own handler so the columns,
       # their order and their names are identical to the stock path.
       mm <- glmGamPoi:::handle_design_parameter(form, dat, meta, NULL)$model_matrix
-      cf <- collapsed_glm_gp(dat, mm, gene_idx = gene_idx, verbose = TRUE,
+      cf <- collapsed_glm_gp(dat, mm, gene_idx = gene_idx, gnames = dat_genes,
+                             verbose = TRUE,
                              threads = max(1L, as.integer(opt$threads)),
                              solver = Sys.getenv("MIXSCALE_SOLVER", "chol"))
       beta_mat <- cf$Beta
@@ -287,7 +336,12 @@ Run_wmvRegDE_scaled_debug <- function(
       return(res_df)
     }
 
-    if (!is.null(gene_idx)) dat <- dat[gene_idx, , drop = FALSE]
+    if (!is.null(gene_idx)) {
+      dat <- dat[gene_idx, , drop = FALSE]
+      dimnames(dat) <- list(dat_genes[gene_idx], dat_cells)
+    } else if (is.null(dimnames(dat)[[1]])) {
+      dimnames(dat) <- list(dat_genes, dat_cells)
+    }
 
     fit <- try(
       glmGamPoi::glm_gp(
@@ -466,9 +520,31 @@ Run_wmvRegDE_scaled_debug <- function(
     mat_all <- mat_all[ord, , drop = FALSE]
     idx_c <- idx_c[ord]
 
-    count_data_sparse <- GetAssayData(object, assay = assay, layer = "counts")
-    if (!identical(idx_c, seq_len(ncol(count_data_sparse))))
+    # Seurat v5 stores a layer WITHOUT dimnames and re-attaches them on fetch, so
+    # GetAssayData() hands back a copy of the whole counts matrix -- measured at
+    # 36.60 GiB peak (nnz = 1.430e9) against 20.44 GiB for taking the raw layer
+    # and setting Dimnames on it, exactly one dgCMatrix (12.13 B/nnz) apart. The
+    # two results are identical(), verified at CM scale, so the accessor is
+    # bypassed and the names are attached directly.
+    .a <- object[[assay]]
+    count_data_sparse <- if (methods::.hasSlot(.a, "layers")) .a@layers[["counts"]] else NULL
+    if (is.null(count_data_sparse))          # v3 Assay, or no counts layer
+      count_data_sparse <- GetAssayData(object, assay = assay, layer = "counts")
+    rm(.a)
+    # Setting the dimnames costs a SECOND full copy: `object` still references the
+    # layer, so R duplicates it to write the slot -- exactly the write-back
+    # duplication that step 2 hit. Nothing here reads the names off the matrix, so
+    # they are carried beside it and handed to the callees that do.
+    cd_genes <- rownames(object)
+    cd_cells <- colnames(object)
+    if (!is.null(dimnames(count_data_sparse)[[1]]))
+      cd_genes <- dimnames(count_data_sparse)[[1]]
+    if (!is.null(dimnames(count_data_sparse)[[2]]))
+      cd_cells <- dimnames(count_data_sparse)[[2]]
+    if (!identical(idx_c, seq_len(ncol(count_data_sparse)))) {
       count_data_sparse <- count_data_sparse[, idx_c, drop = FALSE]
+      cd_cells <- cd_cells[idx_c]
+    }
 
     # count_data_sparse columns are in mat_all row order, so cell-type / NT vs
     # perturbed selections are plain column indices -- no re-match to the full
@@ -494,6 +570,7 @@ Run_wmvRegDE_scaled_debug <- function(
 
       fc_list[[ct]] <- compute_fc_stats(
         counts_mat      = count_data_sparse,
+        feats           = cd_genes,
         p_cols          = p_cols,
         nt_cols         = nt_cols,
         total_counts    = mat_all$nCount_RNA,
@@ -608,7 +685,8 @@ Run_wmvRegDE_scaled_debug <- function(
       # Main genome-wide fit.
       if (length(idx_std_m) > 0) {
         res <- extract_results(count_data_sparse, form_call, mat_all,
-                               gene_idx = idx_std_m)
+                               gene_idx = idx_std_m,
+                               dat_genes = cd_genes, dat_cells = cd_cells)
       } else {
         res <- data.frame(gene_ID = character(0))
       }
@@ -625,6 +703,7 @@ Run_wmvRegDE_scaled_debug <- function(
       # single largest component of step 3. The extracted block is ~100 genes,
       # a few tens of MB, and row-subsetting it afterwards is free.
       loo_mat <- count_data_sparse[idx_loo_m, , drop = FALSE]
+      dimnames(loo_mat) <- list(cd_genes[idx_loo_m], cd_cells)
 
       for (li in seq_along(loo_targets)) {
         g_target <- loo_targets[li]
@@ -664,7 +743,8 @@ Run_wmvRegDE_scaled_debug <- function(
 
     } else {
       res <- extract_results(count_data_sparse, form_call, mat_all,
-                             gene_idx = idx_for_DE)
+                             gene_idx = idx_for_DE,
+                             dat_genes = cd_genes, dat_cells = cd_cells)
     }
 
     fc_mat$gene_ID <- rownames(fc_mat)

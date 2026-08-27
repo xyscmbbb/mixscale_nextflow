@@ -1,0 +1,6 @@
+# The image's R was built with a conda toolchain that is not installed in it, so
+# R CMD SHLIB's default CC does not exist. The kernels are plain C against R's
+# API, so the system gcc is a safe substitute -- glibc is shared, and there is no
+# C++ runtime to mismatch.
+CC = gcc
+CFLAGS = -O2 -fPIC

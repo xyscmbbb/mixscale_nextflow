@@ -93,6 +93,15 @@ process MIXSCALE_PREPROCESS {
     export BLIS_NUM_THREADS=${task.cpus}
     export VECLIB_MAXIMUM_THREADS=${task.cpus}
     export NUMEXPR_NUM_THREADS=${task.cpus}
+    STEP2_THREADS=${params.step2_threads ?: task.cpus}
+
+    # R grows its gc trigger to ~1.6x live and only collects when an allocation
+    # would cross it, so a stage that follows a genuinely large one is allowed
+    # to fill with garbage up to that trigger. At 305k cells that pinned both
+    # ScaleData+RunPCA and DE-gene selection at 51.8 GB on a ~17 GB live set.
+    # Making the trigger track live costs ~2% on the stages it cannot help and
+    # is a pure heap-policy change -- it cannot alter results.
+    export R_GC_MEM_GROW=0
 
     echo "============================================================"
     echo "[STEP 2/3] MIXSCALE_PREPROCESS START: ${perturb_gene}"
@@ -124,6 +133,8 @@ process MIXSCALE_PREPROCESS {
       --min_de_genes ${params.min_de_genes} \\
       --max_de_genes ${params.max_de_genes} \\
       --logfc_threshold ${params.logfc_threshold} \\
+      --threads \$STEP2_THREADS \\
+      --de_target_nnz ${params.de_target_nnz} \\
       --out_rds pert_${perturb_gene}.mixscale_obj.rds \\
       2>&1 | tee step2_mixscale_preprocess.log
 

@@ -55,7 +55,8 @@
 # is global, so beta pass 2 cannot start until every gene's disp_est exists).
 # No IRLS arithmetic is repeated, so results are unchanged.
 
-collapsed_glm_gp <- function(Y, design, gene_idx = NULL, verbose = TRUE,
+collapsed_glm_gp <- function(Y, design, gene_idx = NULL, gnames = NULL,
+                             verbose = TRUE,
                              do_cox_reid_adjustment = TRUE,
                              max_iter_od = 200,
                              gene_chunk = NULL, chunk_budget_gb = 0.5,
@@ -109,7 +110,11 @@ collapsed_glm_gp <- function(Y, design, gene_idx = NULL, verbose = TRUE,
   # stats kernel gets one gene per thread with no write races. Y belongs to the
   # caller now, so this is a genuine doubling of the counts while both live --
   # the largest remaining term in step 3's peak.
-  gnames <- rownames(Y)[gsel]
+  # Taking the gene names as an argument lets the caller hand in an UNNAMED
+  # counts matrix. Seurat v5 stores the layer without dimnames, so naming it
+  # duplicates it -- 17 GB at 305k cells -- purely to label rows that only
+  # this line and the output ever read.
+  gnames <- if (is.null(gnames)) rownames(Y)[gsel] else gnames[gsel]
   Yt <- Matrix::t(Y); gc(FALSE)
   if (verbose) message(sprintf("[collapsed] %d cells -> %d design rows (%.1fx)", n, R, n / R))
 

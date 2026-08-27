@@ -13,3 +13,9 @@ flowchart.html
 *.log
 .DS_Store
 *.bak
+
+# Built by the image (R CMD SHLIB, see docker/Dockerfile) and found through
+# MIXSCALE_HVF_SO. Tracking it would let a stale binary silently disagree with
+# the image it runs in; the source next to it is what belongs in git.
+bin/hvf_kernels.so
+bin/*.o

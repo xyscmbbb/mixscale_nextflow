@@ -11,18 +11,35 @@ suppressPackageStartupMessages({
 # Resolve the helper next to this script regardless of how it was invoked.
 .self <- sub("^--file=", "", grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE))
 source(file.path(dirname(.self), "mixscale_de_genes.R"))
+source(file.path(dirname(.self), "de_genes_lean.R"))
+source(file.path(dirname(.self), "mixscale_de_genes_lean.R"))
+source(file.path(dirname(.self), "lognorm_blocked.R"))
+source(file.path(dirname(.self), "hvf_lowmem.R"))
+source(file.path(dirname(.self), "hvf_detached.R"))
+source(file.path(dirname(.self), "scale_pca_hvf.R"))
 source(file.path(dirname(.self), "mixscale_loo_patch.R"))
 
 # stage timer -- the log needs to show where step 2's time goes so the cost can
 # be projected to a larger NT pool.
 .stage_t0 <- Sys.time()
 .stage_nm <- NULL
+# Reports seconds AND the peak R vector memory reached since the previous
+# stage. A single end-of-run peak says the job needed N GB but not which stage
+# demanded it, and at 305,110 cells the stages differ by tens of GB. gc()'s
+# "max used" is cumulative, so it is reset at each boundary to make the number a
+# per-stage peak; it counts R's own vectors, not an Rcpp callee's Eigen copy, so
+# it is a floor on the cgroup figure rather than a substitute for it.
 stage <- function(name) {
-  if (!is.null(.stage_nm))
-    message(sprintf("[02][time] %-34s %7.1f s", .stage_nm,
-                    as.numeric(difftime(Sys.time(), .stage_t0, units = "secs"))))
+  if (!is.null(.stage_nm)) {
+    g <- gc(full = TRUE)
+    message(sprintf("[02][time] %-34s %7.1f s   peak %6.2f GB",
+                    .stage_nm,
+                    as.numeric(difftime(Sys.time(), .stage_t0, units = "secs")),
+                    sum(g[, "max used"] * c(56, 8)) / 1024^3))
+  }
   .stage_nm <<- name
   .stage_t0 <<- Sys.time()
+  invisible(gc(reset = TRUE, full = TRUE))
 }
 
 
@@ -39,6 +56,12 @@ option_list <- list(
   make_option("--min_de_genes", type = "integer", default = 0),
   make_option("--max_de_genes", type = "integer", default = 100),
   make_option("--logfc_threshold", type = "double", default = 0),
+
+  make_option("--norm_block", type = "integer", default = 20000),
+  make_option("--de_cell_block", type = "integer", default = 20000),
+  make_option("--de_target_nnz", type = "double", default = 1.2e8),
+  make_option("--de_outer_nnz", type = "double", default = 0),   # 0 = same as de_target_nnz
+  make_option("--threads", type = "integer", default = 1),
 
   make_option("--out_rds", type = "character", default = "mixscale_obj.rds")
 )
@@ -75,7 +98,8 @@ CalcPerturbSig_chunked_for_Mixscale <- function(
     chunk.cells = 3000,
     split.by = NULL,
     store.neighbors = FALSE,
-    verbose = TRUE
+    verbose = TRUE,
+    threads = 1L
 ) {
   DefaultAssay(object) <- assay
 
@@ -95,11 +119,16 @@ CalcPerturbSig_chunked_for_Mixscale <- function(
     message("[CalcPerturbSig_chunked] chunk.cells: ", chunk.cells)
   }
 
-  expr <- GetAssayData(
-    object = object,
-    assay = assay,
-    layer = layer
-  )[features, , drop = FALSE]
+  # GetAssayData attaches dimnames to the stored layer, and Seurat v5 stores it
+  # without them -- so the accessor copies the whole data layer (17 GB at 305k)
+  # only to label it before a handful of rows are taken out. The raw layer is
+  # indexed positionally instead and the names go on the small result.
+  .d    <- raw_data_layer(object[[assay]], layer)
+  .fidx <- match(features, rownames(object[[assay]]))
+  stopifnot(!anyNA(.fidx))
+  expr  <- .d[.fidx, , drop = FALSE]
+  dimnames(expr) <- list(features, colnames(object))
+  rm(.d, .fidx)
 
   emb <- Embeddings(object, reduction = reduction)
 
@@ -174,13 +203,28 @@ CalcPerturbSig_chunked_for_Mixscale <- function(
     # (102 times at 305k cells / chunk.cells = 3000). One call for the whole
     # split returns the same neighbours -- same data, same query order, same k
     # -- and the index matrix is only n_cells x k integers.
+    # A query point's neighbours depend only on the tree, which is built from
+    # `data`, so splitting the query across forked workers returns exactly the
+    # rows a single call would -- provided they are rbind-ed in slice order.
+    # Each worker pays its own tree build (nt_emb is only n_NT x ndims doubles,
+    # 72 MB at 300k) and returns an n x k integer matrix, so the extra memory is
+    # negligible; what is divided is the query, which is the expensive half.
+    nthr <- max(1L, as.integer(threads))
+    nthr <- min(nthr, max(1L, floor(nrow(all_emb) / 2000L)))
     message("[CalcPerturbSig_chunked] kNN for all ", length(cells_use),
-            " cells in one nn2 call")
-    nn_all <- RANN::nn2(
-      data = nt_emb,
-      query = all_emb,
-      k = num.neighbors
-    )$nn.idx
+            " cells in ", nthr, " nn2 call(s)")
+    nn_all <- if (nthr > 1L) {
+      sl <- split(seq_len(nrow(all_emb)),
+                  cut(seq_len(nrow(all_emb)), nthr, labels = FALSE))
+      parts <- parallel::mclapply(sl, function(ix)
+        RANN::nn2(data = nt_emb, query = all_emb[ix, , drop = FALSE],
+                  k = num.neighbors)$nn.idx, mc.cores = nthr)
+      stopifnot(all(vapply(parts, is.matrix, logical(1))),
+                sum(vapply(parts, nrow, integer(1))) == nrow(all_emb))
+      do.call(rbind, parts)
+    } else {
+      RANN::nn2(data = nt_emb, query = all_emb, k = num.neighbors)$nn.idx
+    }
     rownames(nn_all) <- cells_use
 
     for (i in seq_along(cell_chunks)) {
@@ -283,13 +327,73 @@ message("[02] logfc_threshold: ", opt$logfc_threshold)
 
 DefaultAssay(obj) <- "RNA"
 
-stage("normalize/HVG/scale/PCA")
 message("[02] NormalizeData / FindVariableFeatures / ScaleData / RunPCA")
-obj <- NormalizeData(obj, verbose = FALSE)
-obj <- FindVariableFeatures(obj, verbose = FALSE)
-obj <- ScaleData(obj, verbose = FALSE)
-obj <- RunPCA(obj, npcs = max(50, opt$ndims), verbose = FALSE)
 
+# One stage per allocation regime. The four sub-stages hold very different
+# working sets -- vst copies counts into Eigen, lognorm holds one column block,
+# ScaleData/PCA hold the dense scale.data -- and a single aggregate peak cannot
+# say which of them set it.
+stage("  HVG (vst on counts)")
+
+# vst reads the COUNTS layer (FindVariableFeatures.StdAssay: layer %||% "counts")
+# and nothing else, so its result does not depend on whether a data layer
+# exists. Running it first means it does not have to share the process with the
+# 17 GB data layer, and it fetches counts through LayerData() -- which
+# duplicates the matrix -- so the overlap it avoids is a full extra copy.
+# Via the object this write-back duplicates the counts matrix; see
+# hvf_detached.R for the measurement and for why the assay is detached first.
+obj <- find_variable_features_detached(obj, assay = "RNA")
+gc(FALSE)
+
+# Seurat's NormalizeData hands the counts matrix to Rcpp BY VALUE, so counts
+# exists three times at once (R original, Eigen copy, R result) -- 59.1 GB peak
+# on a 16 GB matrix at 305,110 cells. lognorm_blocked() is bit-identical and
+# holds one column block.
+# Reach the stored layer directly: LayerData() re-attaches dimnames on fetch,
+# which duplicates the whole matrix (measured +15.8 GB at 305,110 cells).
+# Not wrapped in local() -- `LayerData(...) <-` is a replacement function and
+# would rebind a local copy of obj, leaving the real one untouched.
+# The stored layer is used as-is and the names are handed to lognorm_blocked
+# for the RESULT. Naming the input instead -- what LayerData() does on fetch --
+# copies the whole matrix (measured +15.8 GB at 305,110 cells) purely to label
+# something that is about to be read once.
+stage("  normalize (blocked)")
+# The assay is detached for the write for the same reason as the HVG result:
+# `LayerData(obj[["RNA"]], ...) <- v` hands the assay out through a temporary, so
+# R duplicates it -- deep-copying the counts matrix -- to store the new layer.
+# Measured at CM and projected to 305,110 cells: 73.99 GB through the object vs
+# 49.08 GB detached, with the resulting assay identical and valid. LayerData<-
+# is still what performs the write, so Assay5's @cells/@features maps stay
+# consistent; writing obj@assays$RNA@layers[["data"]] directly is cheaper still
+# but leaves the new layer unregistered (validObject fails).
+.dat <- lognorm_blocked(obj[["RNA"]]@layers[["counts"]], scale.factor = 1e4,
+                        block = opt$norm_block,
+                        dimnames = list(rownames(obj), colnames(obj)))
+.a <- obj@assays[["RNA"]]; obj@assays[["RNA"]] <- NULL
+SeuratObject::LayerData(.a, layer = "data") <- .dat
+rm(.dat)
+obj@assays[["RNA"]] <- .a; rm(.a)
+gc(FALSE)
+message("[02] normalized (blockwise); layers: ",
+        paste(SeuratObject::Layers(obj[["RNA"]]), collapse = ", "))
+
+# counts is not read again until the object is written. Dropping it here takes
+# 16 GB off the peak of every stage that follows -- ScaleData, PCA, the DE gene
+# selection and CalcPerturbSig -- and it is re-read from obj_rds before saving.
+.a <- obj@assays[["RNA"]]; obj@assays[["RNA"]] <- NULL
+SeuratObject::LayerData(.a, layer = "counts") <- NULL
+obj@assays[["RNA"]] <- .a; rm(.a)
+gc(FALSE)
+message("[02] counts layer dropped (re-read from ", opt$obj_rds, " before saving)")
+
+stage("  ScaleData + RunPCA")
+# Run both on a variable-features-only object and transplant the reduction back;
+# see scale_pca_hvf.R for why going through the full object costs a copy of the
+# 17 GB data layer. scale.data is not transplanted -- the block below drops it.
+obj <- scale_pca_hvf(obj, assay = "RNA", npcs = max(50, opt$ndims),
+                     verbose = FALSE)
+
+stage("  DietSeurat + drop scale.data")
 message("[02] Slim object before CalcPerturbSig_chunked")
 obj <- DietSeurat(
   obj,
@@ -321,7 +425,7 @@ gc()
 # were going. The list is handed back to RunMixscale so it does not recompute it.
 stage("DE gene selection (wilcox)")
 message("[02] Precomputing DE genes (RNA assay) to restrict CalcPerturbSig")
-de_genes_list <- mixscale_de_genes(
+de_genes_list <- mixscale_de_genes_lean(
   object = obj,
   labels = opt$target_gene_col,
   nt.class.name = opt$nt_label,
@@ -329,7 +433,11 @@ de_genes_list <- mixscale_de_genes(
   logfc.threshold = opt$logfc_threshold,
   fine.mode = fine_mode,
   fine.mode.labels = if (fine_mode) opt$guide_col else NULL,
-  verbose = TRUE
+  verbose = TRUE,
+  block = opt$de_cell_block,
+  target_nnz = opt$de_target_nnz,
+  outer_nnz = opt$de_outer_nnz,
+  threads = opt$threads
 )
 prtb_features <- unique(unlist(de_genes_list, use.names = FALSE))
 message("[02] DE genes across all targets: ", length(prtb_features),
@@ -356,7 +464,8 @@ obj <- CalcPerturbSig_chunked_for_Mixscale(
   chunk.cells = opt$chunk_cells,
   split.by = NULL,
   store.neighbors = FALSE,
-  verbose = TRUE
+  verbose = TRUE,
+  threads = opt$threads
 )
 
 DefaultAssay(obj) <- "PRTB"
@@ -402,16 +511,17 @@ if (fine_mode) {
 
 message("[02] Slim object after RunMixscale for DE")
 
-mixscale_meta <- obj@meta.data
+# Everything step 3 needs from this run is the metadata and the tools slot (it
+# reads the Mixscale weights from tools$RunMixscale, NOT meta.data). The counts
+# layer was dropped before ScaleData, so the whole in-memory object is released
+# here and the counts are re-read from step 1's output -- same cells, same
+# order -- rather than carried through the memory-heavy middle of the script.
+mixscale_meta  <- obj@meta.data
+mixscale_tools <- obj@tools
+rm(obj); gc()
 
-obj_slim <- obj
-
-DefaultAssay(obj_slim) <- "RNA"
-
-if ("PRTB" %in% Assays(obj_slim)) {
-  obj_slim[["PRTB"]] <- NULL
-}
-
+message("[02] Re-reading counts from ", opt$obj_rds)
+obj_slim <- readRDS(opt$obj_rds)
 obj_slim <- DietSeurat(
   obj_slim,
   assays = "RNA",
@@ -420,8 +530,10 @@ obj_slim <- DietSeurat(
   graphs = NULL,
   misc = FALSE
 )
+stopifnot(identical(colnames(obj_slim), rownames(mixscale_meta)))
 
 obj_slim@meta.data <- mixscale_meta
+obj_slim@tools     <- mixscale_tools
 DefaultAssay(obj_slim) <- "RNA"
 
 gc()
