@@ -496,6 +496,33 @@ values compare equal as character and the counts matrix is untouched, so only
 subsetting. At 5,000 targets the un-fixed version would carry 4,999 empty factor
 levels into every downstream `model.matrix`.
 
+### End to end, shard input vs whole-file input
+
+The step-1 gate above holds cell ORDER fixed. The repacked file does not: it is
+sorted NT-first, so a job reading it gets the same cells in a different order than
+the old shard did. That is not free -- floating-point sums are order-dependent --
+so the whole pipeline was run twice on the same code, once from `CM_PDHA1.h5ad`
+and once from the sorted repack, and the outputs compared:
+
+| quantity | result |
+|---|---|
+| gene set fitted | identical, 22,898 both |
+| `log2FC` | **bit-identical** (`identical()` TRUE) |
+| `mixscale_score` | **bit-identical** |
+| `p_weight` | median abs diff 1.1e-14, max 1.0e-2 |
+| DEG Jaccard, BH<0.05 and BH<0.01, both with and without a 0.25 log2FC gate | **1.000000** |
+
+The p-value drift is the Gamma-Poisson overdispersion MLE reaching a slightly
+different stopping point when its per-cell terms are summed in a different order.
+It is confined to genes that are not significant: the single largest drift is on a
+gene at p = 0.55, and across every gene with p < 0.05 in either run the largest
+drift is **1.4e-8**. Nothing crosses a threshold, in either direction, at any gate.
+
+So the input change is output-neutral in every respect that is read downstream. If
+you need `p_weight` itself bit-reproducible against an old shard run, repack
+without the sort (correctness never depended on it -- only the two-runs-instead-of
+-thousands read speed does).
+
 ### Two properties of the file, both load-bearing
 
 Neither is optional, and the source files as written satisfy neither:
@@ -567,6 +594,7 @@ per perturbation on spot, **$318 for 5,000 targets**:
 |---|---|---|---|
 | 1 (h5ad -> Seurat) | 950.9 s / 112.63 GB | **270.3 s / 32.61 GB** | DIGEST == REFERENCE |
 | 1 input | per-target shard (~16 TB for 5,000) | **one repacked file per cell line** | counts + meta.data `identical()` to the shard build |
+| 1 input, end to end | -- | -- | `log2FC` and `mixscale_score` bit-identical, DEG Jaccard 1.000000 |
 | 2 (preprocess + Mixscale) | 4734.0 s / 64.62 GB | **1158.2 s / 43.94 GB** | `STEP2 OBJECTS IDENTICAL` on HeLa/RPL9 |
 | 3 (weighted DE) | does not fit (dense `Mu` = 77 GB) | **380.1 s / 37.85 GB** | DE CSV byte-identical |
 
