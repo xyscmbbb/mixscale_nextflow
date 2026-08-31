@@ -1,0 +1,26 @@
+# Adds gcsfs, so --h5ad can be a gs:// URI that is read in place.
+#
+# The pipeline used to be handed a per-target shard, which the WDL localised with
+# gsutil before step 1 opened it. Step 1 now selects its own cells out of the
+# whole cell-line h5ad, and the point of doing that is lost if the whole h5ad has
+# to land on the VM's disk first: at 3M cells that is a ~31 GB download and ~140 GB
+# of local disk to hold a file the job reads ~10% of.
+#
+# gcsfs gives h5py a seekable Python file object over the GCS object, so h5py
+# issues ranged GETs for exactly the bytes it touches. With the h5ad repacked CSR
+# and sorted by target_gene (tools/repack_h5ad.py), the bytes it touches are two
+# contiguous runs -- the NT block and this target's block -- so a job transfers
+# about what the old shard was, downloads nothing, and needs no input disk.
+#
+# gcsfs is pinned with fsspec: the two are released in lockstep and gcsfs pins a
+# narrow fsspec range, so letting pip resolve them freshly on every image build is
+# how you get a working image today and a broken one next month.
+FROM docker.io/xyscmbbb/r-mixscale:1.1.10
+
+RUN /opt/miniconda3/envs/mixscale/bin/pip install --no-cache-dir \
+      "gcsfs==2025.9.0" "fsspec==2025.9.0" \
+ && /opt/miniconda3/envs/mixscale/bin/python -c "\
+import gcsfs, fsspec, h5py; \
+print('gcsfs', gcsfs.__version__, 'fsspec', fsspec.__version__); \
+import anndata.io; \
+print('anndata.io.read_elem OK')"

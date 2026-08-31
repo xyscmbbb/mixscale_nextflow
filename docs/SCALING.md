@@ -455,6 +455,107 @@ $0.0867). The VST fix is what brings the *provisioned* figure within sight of
 the extended-memory line; the last few GB to actually cross it would have to
 come from the `data`-layer change above.
 
+## 6. No per-target shards
+
+Every number above was measured on a `pert_<GENE>.h5ad` shard: that target's cells
+plus the whole NT pool, cut upstream and handed to the job. That input does not
+survive the screen it was built for.
+
+At 3M cells with 305k NT, a shard is **~99.8% NT cells**, so ~5,000 targets means
+writing and storing ~5,000 copies of the same NT pool:
+
+| | per-target shards | whole-file + in-job selection |
+|---|---|---|
+| artefacts per cell line | ~5,000 | **1** |
+| storage | ~16 TB | ~31 GB |
+| storage cost | ~$320/month | **~$0.62/month** |
+| build time | ~14 months serial, ~27 days at 16x | **~40 min** |
+| per job | download a ~3.2 GB shard | ~3.2 GB of ranged reads, nothing on disk |
+
+The build-time figure is the anndata gzip write rate measured here, 12.8 MB/s.
+The sharding stage costs more than the analysis it feeds.
+
+### What step 1 does instead
+
+`--h5ad` is now the whole cell-line file. Step 1 computes its own cell set --
+`target_gene in {perturb_gene, nt_label}`, optionally AND-ed with a boolean
+allowlist column named by `--keep_cell_col` -- and reads only those rows'
+nonzeros: one bounded HDF5 slice per contiguous run of wanted cells, straight
+into `new("dgCMatrix", i=, p=, x=)`.
+
+**Gated `identical()`.** Reading PDHA1's cells out of the whole 125,439-cell CM
+file yields a Seurat object identical to the one built from the pre-made shard --
+counts matrix *and* `meta.data`. Measured through Nextflow: **2 runs, 12.7% of the
+file's 588M nonzeros, 6.8 s**.
+
+One real bug fell out of that gate and is worth remembering: **anndata drops unused
+categorical levels when it subsets**, so a shard arrived carrying only its 2
+`target_gene` levels while an in-job subset of the whole file kept all 26. The
+values compare equal as character and the counts matrix is untouched, so only
+`identical()` on `meta.data` catches it. Step 1 now calls `droplevels()` after
+subsetting. At 5,000 targets the un-fixed version would carry 4,999 empty factor
+levels into every downstream `model.matrix`.
+
+### Two properties of the file, both load-bearing
+
+Neither is optional, and the source files as written satisfy neither:
+
+- **X must be CSR.** A CSR `indptr` is over *cells*, so a cell set is a set of row
+  slices. These files are written `csc_matrix`, whose `indptr` is over *genes* --
+  there a cell subset touches every nonzero (measured: 15.5 s to scan CM's 588M
+  nnz locally, and over GCS it means fetching all 31 GB to use 3.2 GB).
+  CSR(cells x genes) is also bit-identical to CSC(genes x cells), which is the
+  layout Seurat wants, so this removes step 1's transpose as well (section 4).
+- **Rows sorted by `target_gene`, NT first.** Each target is then one contiguous
+  range and a job reads exactly two runs. Unsorted, NT+PDHA1 on the real CM file
+  is **13,965 scattered runs**.
+
+`tools/repack_h5ad.py` does both, once per cell line, and writes a
+`.rowindex.csv` sidecar giving each target's `[start, end)`. It refuses to write
+that sidecar if any target ended up split across more than one run, so the file
+existing is the assertion that the sort worked.
+
+**It does the transpose in memory and stops above `--max-nnz-in-memory` (2e9).**
+At 3M cells (~14e9 nnz) it will not run, and a blocked transpose is the wrong fix:
+do the sort and `adata.X = adata.X.tocsr()` in whatever *writes*
+`filtered_correct_pairs.h5ad`, where it is nearly free. The PotC producer side is
+`lib/repack_h5ad.py` on branch `single-guide-large-scale` of
+`PotC_pilot_perturb_analysis`, which replaced that repo's sharding stage.
+
+### Reading it without downloading it
+
+Image **1.1.11** adds `gcsfs`. Step 1 opens a `gs://` URI through it and hands the
+Python file object to `h5py`, which issues ranged GETs for just those row runs, so
+the 31 GB file never lands on disk. `obs`/`var` come off the same handle via
+`anndata.io.read_elem`. Same-region GCS reads are not billed for egress.
+
+Three designs were costed; ranged reads won:
+
+| | transfer | disk_gb | $/job |
+|---|---|---|---|
+| whole-file `gsutil cp` | ~31 GB | 100 | ~$0.087 |
+| NT block + tiny per-target shards | ~3.2 GB | 100 | ~$0.075 |
+| **ranged reads via gcsfs** | **~3.2 GB** | **60** | **~$0.071** |
+
+### Cost
+
+Same 8 vCPU / 58 GB spot VM as section 5; what changes is the disk, because the
+input no longer has to fit on it. Disk is billed at the full rate with **no spot
+discount**, which is why 40 GB of it is worth more than it looks:
+
+| | billed | compute | disk | total | x 5,000 |
+|---|---|---|---|---|---|
+| localised shard, 100 GB | 32.0 min | $0.0629 | $0.0124 | $0.0754 | $377 |
+| **ranged reads, 60 GB** | 32.5 min | $0.0638 | **$0.0076** | **$0.0714** | **$357** |
+
+The billed time goes slightly *up*: ~32 s of `gsutil cp` is replaced by ~60 s of
+ranged reads inside step 1, which is a wash against a $0.0048 disk saving. The
+shard-build and storage cost, ~16 TB and weeks of wall clock, is what actually
+goes away -- and it never appeared on this page because it was somebody else's
+line item.
+
+**Still under the $0.10/perturbation target, with the whole sharding stage gone.**
+
 ## Status
 
 All three steps are measured at 305,110 cells, 8 vCPU, and every change below is
@@ -465,6 +566,7 @@ per perturbation on spot, **$318 for 5,000 targets**:
 | step | stock | now | gate |
 |---|---|---|---|
 | 1 (h5ad -> Seurat) | 950.9 s / 112.63 GB | **270.3 s / 32.61 GB** | DIGEST == REFERENCE |
+| 1 input | per-target shard (~16 TB for 5,000) | **one repacked file per cell line** | counts + meta.data `identical()` to the shard build |
 | 2 (preprocess + Mixscale) | 4734.0 s / 64.62 GB | **1158.2 s / 43.94 GB** | `STEP2 OBJECTS IDENTICAL` on HeLa/RPL9 |
 | 3 (weighted DE) | does not fit (dense `Mu` = 77 GB) | **380.1 s / 37.85 GB** | DE CSV byte-identical |
 
@@ -489,3 +591,12 @@ Open:
   from 8-thread BLAS reduction order (`determinism_ab.sh` needs re-running).
 - The 458k-cell dgCMatrix ceiling is unaddressed; block-streaming (section 4) is
   the answer if a target ever exceeds it.
+- **`tools/repack_h5ad.py` will not run at 3M cells** -- its transpose is
+  in-memory and it stops above 2e9 nonzeros (section 6). The intended fix is
+  upstream (write the source sorted and CSR), not a blocked transpose here.
+- **The gcsfs path has not been exercised against real GCS.** Everything except
+  the transport is verified in-image -- `gcsfs`/`fsspec` import, `h5py` accepting
+  a Python file object and slicing it correctly, `anndata.io.read_elem` on `obs`
+  and `var` -- and the whole selection path is gated on a local file. What is
+  untested is a live `gs://` open: ranged-GET latency at 3M-cell scale, and
+  whether `block_size = 16 MiB` is the right read-ahead.

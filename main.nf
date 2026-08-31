@@ -12,7 +12,7 @@ process CONVERT_H5AD_TO_OBJ {
     memory params.mem_step1  ?: params.memory
 
     input:
-    path h5ad
+    val h5ad
     path pair_csv
     val perturb_gene
 
@@ -20,6 +20,9 @@ process CONVERT_H5AD_TO_OBJ {
     tuple val(perturb_gene), path("pert_${perturb_gene}.seurat_obj.rds")
 
     script:
+    // Empty string means "no allowlist"; optparse would take `--keep_cell_col`
+    // with nothing after it as the next flag, so omit the option entirely.
+    def keep_cell_arg = params.keep_cell_col ? "--keep_cell_col ${params.keep_cell_col}" : ""
     """
     set -euo pipefail
 
@@ -40,21 +43,23 @@ process CONVERT_H5AD_TO_OBJ {
     echo "[STEP 1/3] cell_col: ${params.cell_col}"
     echo "[STEP 1/3] guide_col: ${params.guide_col}"
     echo "[STEP 1/3] nt_label: ${params.nt_label}"
+    echo "[STEP 1/3] keep_cell_col: ${params.keep_cell_col ?: '<none>'}"
     echo "[STEP 1/3] task.cpus: ${task.cpus}"
     echo "[STEP 1/3] task.memory: ${task.memory}"
     echo "[STEP 1/3] nproc: \$(nproc)"
     echo "============================================================"
 
     stdbuf -oL -eL Rscript ${projectDir}/bin/01_convert_h5ad_to_obj.R \\
-      --h5ad ${h5ad} \\
+      --h5ad "${h5ad}" \\
       --pair_csv ${pair_csv} \\
-      --perturb_gene ${perturb_gene} \\
-      --target_gene_col ${params.target_gene_col} \\
-      --cell_col ${params.cell_col} \\
-      --guide_col ${params.guide_col} \\
-      --nt_label ${params.nt_label} \\
+      --perturb_gene "${perturb_gene}" \\
+      --target_gene_col "${params.target_gene_col}" \\
+      --cell_col "${params.cell_col}" \\
+      --guide_col "${params.guide_col}" \\
+      --nt_label "${params.nt_label}" \\
       --max_features ${params.max_features} \\
       --subset_to_gene ${params.subset_to_gene} \\
+      ${keep_cell_arg} \\
       --out_rds pert_${perturb_gene}.seurat_obj.rds \\
       2>&1 | tee step1_convert_h5ad.log
 
@@ -124,9 +129,9 @@ process MIXSCALE_PREPROCESS {
 
     stdbuf -oL -eL Rscript ${projectDir}/bin/02_mixscale_preprocess.R \\
       --obj_rds ${seurat_obj} \\
-      --target_gene_col ${params.target_gene_col} \\
-      --guide_col ${params.guide_col} \\
-      --nt_label ${params.nt_label} \\
+      --target_gene_col "${params.target_gene_col}" \\
+      --guide_col "${params.guide_col}" \\
+      --nt_label "${params.nt_label}" \\
       --ndims ${params.ndims} \\
       --num_neighbors ${params.num_neighbors} \\
       --chunk_cells ${params.chunk_cells} \\
@@ -198,9 +203,9 @@ process RUN_WMVREGDE {
 
     stdbuf -oL -eL Rscript ${projectDir}/bin/03_Run_wmvRegDE_scaled_debug.R \\
       --obj_rds ${mixscale_obj} \\
-      --perturb_gene ${perturb_gene} \\
-      --target_gene_col ${params.target_gene_col} \\
-      --nt_label ${params.nt_label} \\
+      --perturb_gene "${perturb_gene}" \\
+      --target_gene_col "${params.target_gene_col}" \\
+      --nt_label "${params.nt_label}" \\
       --subsample ${params.subsample} \\
       --logfc_threshold ${params.logfc_threshold} \\
       --min_pct ${params.min_pct} \\
@@ -233,7 +238,21 @@ workflow {
         error "Please provide --perturb_gene"
     }
 
-    h5ad_ch = Channel.fromPath(params.h5ad, checkIfExists: true)
+    // The h5ad is passed to step 1 as a STRING, never staged.
+    //
+    // It is now the whole cell-line file (~31 GB at 3M cells), not a per-target
+    // shard, and step 1 reads only the rows it needs. Channel.fromPath would
+    // defeat that twice over: for a gs:// URI Nextflow would download the whole
+    // object before the process starts, and for a local path it would symlink a
+    // 31 GB file into every work dir. Handing over the path itself is safe here
+    // because this pipeline pins executor = 'local' (see nextflow.config) -- the
+    // task runs on the same filesystem, so there is nothing to stage.
+    def is_remote = params.h5ad ==~ /^[a-z0-9+.-]+:\/\/.*/
+    h5ad_ch = is_remote
+        ? Channel.value(params.h5ad)
+        : Channel.fromPath(params.h5ad, checkIfExists: true)
+                 .map { it.toAbsolutePath().toString() }
+
     pair_csv_ch = Channel.fromPath(params.pair_csv, checkIfExists: true)
 
     convert_ch = CONVERT_H5AD_TO_OBJ(

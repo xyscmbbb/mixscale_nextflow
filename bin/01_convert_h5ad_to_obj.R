@@ -58,12 +58,40 @@ message("[01] Reading h5ad: ", opt$h5ad)
 anndata <- import("anndata", convert = FALSE)
 np      <- import("numpy",   convert = FALSE)
 bi      <- import_builtins(convert = FALSE)
+h5py    <- import("h5py",    convert = FALSE)
+ad_io   <- import("anndata.io", convert = FALSE)
 
-# obs/var only -- backed="r" leaves X on disk so it is never materialised twice.
-ad <- anndata$read_h5ad(opt$h5ad, backed = "r")
-cell_names <- py_to_r(ad$obs_names$to_list())
-gene_names <- py_to_r(ad$var_names$to_list())
-obs        <- py_to_r(ad$obs)
+is_gcs <- grepl("^gs://", opt$h5ad)
+
+# One handle for obs, var and X. h5py takes a Python file object as happily as a
+# path, which is what lets --h5ad be a gs:// URI: gcsfs turns the object into a
+# seekable file and h5py then issues ranged GETs for only the bytes it reads.
+# Combined with the CSR row subset below, a job transfers its own cells and
+# nothing else -- the whole h5ad never lands on the VM's disk.
+gcs_file <- NULL
+if (is_gcs) {
+  gcsfs <- tryCatch(import("gcsfs", convert = FALSE), error = function(e)
+    stop("[01] --h5ad is a gs:// URI but the python gcsfs package is missing. ",
+         "Use image r-mixscale:1.1.11 or newer, or pass a local path."))
+  # block_size is the ranged-GET size. Too small and a 5 GB slice becomes tens of
+  # thousands of round trips; 16 MiB keeps the read sequential and the count sane.
+  fs_gcs   <- gcsfs$GCSFileSystem()
+  gcs_file <- fs_gcs$open(sub("^gs://", "", opt$h5ad), "rb",
+                          block_size = bi$int(16777216))
+  fh <- h5py$File(gcs_file, "r")
+  message("[01] reading over gcsfs (ranged GETs, 16 MiB blocks); ",
+          "the h5ad is NOT downloaded")
+} else {
+  fh <- h5py$File(opt$h5ad, "r")
+}
+
+# obs/var only -- X stays on disk (or in GCS) so it is never materialised twice.
+obs_py     <- ad_io$read_elem(fh[["obs"]])
+var_py     <- ad_io$read_elem(fh[["var"]])
+cell_names <- py_to_r(obs_py$index$astype("str")$to_list())
+gene_names <- py_to_r(var_py$index$astype("str")$to_list())
+obs        <- py_to_r(obs_py)
+rm(obs_py, var_py)
 
 # Read one HDF5 dataset into a preallocated R vector in slices, so python never
 # holds the whole array alongside the R copy.
@@ -159,8 +187,6 @@ message("[01] Cells selected: ", length(keep_idx), " / ", length(keep_cells))
 
 rows_already_subset <- FALSE
 
-h5py <- import("h5py", convert = FALSE)
-fh   <- h5py$File(opt$h5ad, "r")
 Xg   <- fh[["X"]]
 enc  <- tryCatch(as.character(py_to_r(Xg$attrs[["encoding-type"]])), error = function(e) "")
 
@@ -235,6 +261,7 @@ if (enc %in% c("csr_matrix", "csc_matrix")) {
       }
     }
     fh$close()
+    if (!is.null(gcs_file)) gcs_file$close()
 
     p_vec <- as.integer(c(0, cumsum(row_nnz)))
     counts <- new("dgCMatrix", i = i_vec, p = p_vec, x = x_vec,
@@ -253,6 +280,7 @@ if (enc %in% c("csr_matrix", "csc_matrix")) {
     message("[01] reading data ...")
     x_vec <- h5_read_vec(Xg[["data"]], nnz, FALSE)
     fh$close()
+    if (!is.null(gcs_file)) gcs_file$close()
 
     # new() shares these vectors rather than copying them; the validity check is
     # what guarantees the stored indices were sorted within each slice.
@@ -273,6 +301,10 @@ if (enc %in% c("csr_matrix", "csc_matrix")) {
   message("[01][WARN] X is not sparse (encoding-type '", enc, "'); ",
           "falling back to the scipy COO path (much heavier).")
   fh$close()
+  if (!is.null(gcs_file)) gcs_file$close()
+  if (is_gcs)
+    stop("[01] X is not sparse and --h5ad is a gs:// URI. The dense fallback ",
+         "re-reads the file by path; localise it first, or store X sparse.")
   scipy <- import("scipy.sparse", convert = FALSE)
   ad2 <- anndata$read_h5ad(opt$h5ad)
   X <- ad2$X

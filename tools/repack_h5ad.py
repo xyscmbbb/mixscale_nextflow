@@ -2,6 +2,13 @@
 """
 Repack one cell line's h5ad into the layout step 1 can subset without reading it all.
 
+The same tool as lib/repack_h5ad.py in
+https://github.com/xyscmbbb/PotC_pilot_perturb_analysis (branch
+single-guide-large-scale); only these first paragraphs differ. That copy is where the
+file is actually produced -- it is stage 3 of that repo's 02_run_potc_qc_first_repack.sh,
+which replaced its per-target sharding stage. This copy keeps the Mixscale side
+self-contained for inputs that never came through PotC. Change both.
+
 Why this exists
 ---------------
 The pipeline used to be fed a per-target shard: `pert_<GENE>.h5ad` = that target's
