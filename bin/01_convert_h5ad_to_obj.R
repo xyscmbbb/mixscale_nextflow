@@ -75,11 +75,28 @@ if (is_gcs) {
          "Use image r-mixscale:1.1.11 or newer, or pass a local path."))
   # block_size is the ranged-GET size. Too small and a 5 GB slice becomes tens of
   # thousands of round trips; 16 MiB keeps the read sequential and the count sane.
+  #
+  # cache_type MATTERS MORE THAN block_size, and the default is the wrong one.
+  # fsspec defaults to "readahead", which holds exactly ONE block and drops it on
+  # the next miss. h5py does not read front to back -- it walks the superblock and
+  # object headers, which live at scattered offsets -- so every metadata hop
+  # evicts the block the previous hop just paid 16 MiB for. "blockcache" keeps an
+  # LRU of blocks instead, so those hops hit. Measured on a 292 MB CSR h5ad in
+  # GCS, reading every row:
+  #
+  #   readahead  16 MiB   405.3 MB fetched   1.40x amplification   4.80 s
+  #   blockcache 16 MiB   302.0 MB fetched   1.05x                 2.80 s
+  #
+  # maxblocks caps the LRU, and hence the RAM this holds: 8 x 16 MiB = 134 MB.
+  # Anything from 4 up measured the same wall clock, so this is the small end of
+  # the flat region rather than a tuned value.
   fs_gcs   <- gcsfs$GCSFileSystem()
   gcs_file <- fs_gcs$open(sub("^gs://", "", opt$h5ad), "rb",
-                          block_size = bi$int(16777216))
+                          block_size  = bi$int(16777216),
+                          cache_type  = "blockcache",
+                          cache_options = bi$dict(maxblocks = bi$int(8)))
   fh <- h5py$File(gcs_file, "r")
-  message("[01] reading over gcsfs (ranged GETs, 16 MiB blocks); ",
+  message("[01] reading over gcsfs (ranged GETs, 16 MiB blocks, blockcache); ",
           "the h5ad is NOT downloaded")
 } else {
   fh <- h5py$File(opt$h5ad, "r")

@@ -556,6 +556,32 @@ Python file object to `h5py`, which issues ranged GETs for just those row runs, 
 the 31 GB file never lands on disk. `obs`/`var` come off the same handle via
 `anndata.io.read_elem`. Same-region GCS reads are not billed for egress.
 
+**Verified live against GCS** (292 MB CSR h5ad, the pushed 1.1.11 image, the same
+reticulate calls step 1 makes): the handle opens in 0.4 s, `BlockCache` is the
+cache in force, and 5,000 rows / 9.9M nonzeros come back in 0.46 s.
+
+**`cache_type` is worth more than `block_size`, and fsspec's default is wrong for
+h5py.** The default `readahead` cache holds ONE block and drops it on the next
+miss. h5py does not read front to back -- it walks a superblock and object headers
+at scattered offsets -- so each metadata hop evicts the 16 MiB block the last hop
+just paid for. Reading every row of that file:
+
+| cache_type | block | fetched | amplification | wall |
+|---|---|---|---|---|
+| `readahead` (fsspec default) | 16 MiB | 405.3 MB | 1.40x | 4.80 s |
+| **`blockcache`** | **16 MiB** | **302.0 MB** | **1.05x** | **2.80 s** |
+| `bytes` | 16 MiB | 173.7 MB* | 5.94x* | 1.65 s* |
+| `none` | -- | 29.5 MB* | 1.01x* | 20.8 s* |
+
+\* small-slice figures; the `none` row is the trap -- minimal bytes, 449 GETs, and
+7x the wall clock.
+
+Just opening the file costs bytes, and that cost scales with `block_size`: 3.1 MB
+at 1 MiB blocks, 33.6 MB at 16 MiB. It is a fixed per-job cost, so it amortises
+against a real read (1.05x over 289 MB) but dominates a small one. `maxblocks=8`
+caps the LRU at 134 MB of RAM; every value from 4 up measured the same wall clock,
+so that is the small end of a flat region, not a tuned number.
+
 Three designs were costed; ranged reads won:
 
 | | transfer | disk_gb | $/job |
