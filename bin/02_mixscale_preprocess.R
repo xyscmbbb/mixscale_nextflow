@@ -445,7 +445,25 @@ message("[02] DE genes across all targets: ", length(prtb_features),
         round(nrow(obj[["RNA"]]) / max(1, length(prtb_features))), "x fewer PRTB rows)")
 
 if (length(prtb_features) == 0) {
-  stop("[02] No DE genes selected for any target; cannot build a PRTB assay.")
+  # A target with no DE genes against NT is not an error -- it is a perturbation with no
+  # detectable transcriptional effect, and upstream Mixscale handles it: RunMixscale's
+  # length(prtb_markers[[s]][[gene]]) == 0 branch labels those cells "<gene> NP", and step 3
+  # then falls back to standard binary weights (perturbed = 1, NT = 0). Observed on AGMO,
+  # whose gene has zero expression in microglia, so CRISPRi of it does nothing.
+  #
+  # Only THIS branch turns that into a failure: hoisting DE-gene selection ahead of
+  # CalcPerturbSig (the optimisation that shrinks PRTB) made an empty set fatal, where
+  # `main` -- which has no precompute -- never sees the problem.
+  #
+  # CalcPerturbSig still needs rows to build PRTB from, so fall back to variable features.
+  # Capped at max_de_genes because the CONTENT is irrelevant here (RunMixscale discards it
+  # on the NP branch): taking all ~2,000 would make PRTB, which is dense, 20x larger than a
+  # normal target's for a result that is thrown away.
+  fallback <- utils::head(VariableFeatures(obj), max(1L, opt$max_de_genes))
+  message("[02] No DE genes for any target -- falling back to ", length(fallback),
+          " variable features so CalcPerturbSig can build PRTB. RunMixscale will class ",
+          "these cells NP and step 3 will use binary weights.")
+  prtb_features <- fallback
 }
 
 stage("CalcPerturbSig (kNN + PRTB)")
