@@ -171,21 +171,25 @@ process RUN_WMVREGDE {
     path "pert_${perturb_gene}_de_res_df.csv"
     path "pert_${perturb_gene}_meta_data.csv"
 
-    script:
-    """
-    set -euo pipefail
-
-    // The BLAS must be pinned to ONE thread here, which is the opposite of steps
-    // 1 and 2. The collapsed solver parallelises over GENES itself (OpenMP with an
-    // explicit num_threads clause, so OMP_NUM_THREADS does not cap it), and every
-    // BLAS call inside a gene is tiny -- a n_groups x 3 matvec, a 3x3 inverse. A
-    // multi-threaded OpenBLAS spins its worker pool on each of those, and with the
-    // per-gene loop also running it oversubscribes the box. Measured on 4,678 cells
-    // x 20,251 genes, pass A only:
+    // The BLAS must be pinned to ONE thread in the script below, which is the
+    // opposite of steps 1 and 2. The collapsed solver parallelises over GENES
+    // itself (OpenMP with an explicit num_threads clause, so OMP_NUM_THREADS does
+    // not cap it), and every BLAS call inside a gene is tiny -- a n_groups x 3
+    // matvec, a 3x3 inverse. A multi-threaded OpenBLAS spins its worker pool on
+    // each of those, and with the per-gene loop also running it oversubscribes the
+    // box. Measured on 4,678 cells x 20,251 genes, pass A only:
     //   threads=1, OPENBLAS=6   > 2160 s (did not finish)
     //   threads=1, OPENBLAS=1     197 s
     //   threads=6, OPENBLAS=1      43 s
     // gp_weighted.cpp says the same thing above fit_gp_weighted_s_cpp.
+    //
+    // Keep these notes OUT of the script block: it is a shell string, not Groovy,
+    // so a `//` line is handed to bash and the task dies with
+    // `.command.sh: line 4: //: Is a directory` (exit 126).
+    script:
+    """
+    set -euo pipefail
+
     export OMP_NUM_THREADS=${task.cpus}
     export OPENBLAS_NUM_THREADS=1
     export MKL_NUM_THREADS=1
