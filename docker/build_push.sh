@@ -8,12 +8,13 @@
 # Each tag is one layer on the one before it:
 #   1.1.9   HVG kernels compiled in, exported as MIXSCALE_HVF_SO
 #   1.1.10  collapsed Gamma-Poisson solver precompiled, conda toolchain on PATH
+#   1.1.11  gcsfs, so --h5ad can be a gs:// URI read in place (no localisation)
 #
 # The build context is assembled here from bin/, so the sources in bin/ stay the
 # single source of truth and no binary is tracked in the repo. Requires a docker
 # login that can push to the xyscmbbb namespace.
 set -euo pipefail
-TAG=${1:-1.1.10}
+TAG=${1:-1.1.11}
 IMAGE=xyscmbbb/r-mixscale:$TAG
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN=${BIN:-$HERE/../bin}
@@ -25,20 +26,26 @@ case "$TAG" in
     DOCKERFILE=$HERE/Dockerfile
     SRC=("$BIN/hvf_kernels.c" "$BIN/Makevars")
     ;;
-  *)
+  1.1.10)
     BASE=docker.io/xyscmbbb/r-mixscale:1.1.9
     DOCKERFILE=$HERE/Dockerfile.1.1.10
     SRC=("$BIN/collapsed/gp_weighted.cpp" "$BIN/collapsed/gp_overdisp_w.cpp")
     ;;
+  *)
+    # Nothing is compiled from bin/ here, so the build context carries no sources.
+    BASE=docker.io/xyscmbbb/r-mixscale:1.1.10
+    DOCKERFILE=$HERE/Dockerfile.1.1.11
+    SRC=()
+    ;;
 esac
 
-for f in "${SRC[@]}"; do
+for f in ${SRC[@]+"${SRC[@]}"}; do
   [ -f "$f" ] || { echo "missing $f"; exit 1; }
 done
 
 CTX=$(mktemp -d)
 trap 'rm -rf "$CTX"' EXIT
-cp "${SRC[@]}" "$CTX/"
+[ ${#SRC[@]} -gt 0 ] && cp "${SRC[@]}" "$CTX/"
 cp "$DOCKERFILE" "$CTX/Dockerfile"
 
 echo "=== building $IMAGE from $BASE ==="
@@ -86,6 +93,25 @@ else
     stopifnot(identical(Sys.getenv("RETICULATE_PYTHON"),
                         "/opt/miniconda3/envs/mixscale/bin/python"))
     cat("prebuilt cache reused, env OK\n")'
+fi
+
+if [ "$TAG" = "1.1.11" ]; then
+  # The layer's whole purpose: h5py must accept a Python file object, because
+  # that is how a gs:// h5ad is read without localising it. Checked against a
+  # real (local) file object here -- reaching GCS needs credentials this build
+  # does not have, but everything except the transport is exercised.
+  docker run --rm "$IMAGE" /opt/miniconda3/envs/mixscale/bin/python -c '
+import gcsfs, fsspec, h5py, numpy as np, tempfile, os
+from anndata.io import read_elem
+print("gcsfs", gcsfs.__version__, "fsspec", fsspec.__version__)
+p = os.path.join(tempfile.mkdtemp(), "t.h5")
+with h5py.File(p, "w") as f:
+    f.create_dataset("d", data=np.arange(1000, dtype="int32"))
+with h5py.File(open(p, "rb"), "r") as f:
+    assert f["d"][10:20].tolist() == list(range(10, 20))
+print("h5py over a file object: ranged slice OK")
+gcsfs.GCSFileSystem
+print("read_elem", read_elem.__name__, "OK")'
 fi
 
 if [ "$PUSH" = "1" ]; then
