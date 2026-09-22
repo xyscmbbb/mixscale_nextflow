@@ -32,9 +32,12 @@ option_list <- list(
                            "makes multi-million-cell fits possible at all. Default: false")),
   make_option("--fc_norm", type = "character", default = "log.norm",
               help = paste("How avg_log2FC is computed: 'log.norm' (default) uses the",
-                           "library-size-normalised expression, matching Seurat's",
-                           "LogNormalize convention; 'raw' reproduces upstream Mixscale's",
-                           "un-normalised counts behaviour. See NOTE in compute_fc_stats().")),
+                           "library-size-normalised expression with the pseudocount on the",
+                           "group sum, matching Seurat >= 5.0 FoldChange();",
+                           "'log.norm.v4' puts the pseudocount on the mean, as Seurat <= 4.x",
+                           "did, which compresses lowly expressed genes;",
+                           "'raw' reproduces upstream Mixscale's un-normalised counts",
+                           "behaviour. See NOTE in compute_fc_stats().")),
   make_option("--threads", type = "integer", default = 1,
               help = paste("Worker threads for the --collapsed solver only (OpenMP over",
                            "genes in the IRLS/SE passes, forked workers for the",
@@ -100,21 +103,39 @@ obj <- readRDS(opt$obj_rds)
 #   (b) The pseudocount is added to the SUM, so the term is rowMeans + 1/N. With
 #       unequal group sizes a gene absent from both groups gets
 #       log2(N_nt / N_pert) instead of 0 -- e.g. +5.7 for 319 perturbed vs 16,297
-#       NT cells. The bias is largest for lowly expressed genes and for
-#       perturbations with few cells, which is exactly where it does most damage.
-#
-# Upstream's own get_fc() (R/get_fold_change.R) uses the correct convention,
-#     log(mean(x) + pseudocount.use)  /  log(mean(expm1(x)) + pseudocount.use)
-# and exposes norm.method = 'log.norm'; Run_wmvRegDE() simply never calls it.
+#       NT cells.
 #
 # We therefore default to fc_norm = "log.norm":
-#     avg_log2FC = log2(mean(counts / nCount_RNA * scale.factor) + pseudocount)
-# which is identical to Seurat's FoldChange() on the LogNormalize "data" layer,
+#     avg_log2FC = log2((sum(counts / nCount_RNA * scale.factor) + pseudocount) / n)
+# which is Seurat >= 5.0 FoldChange.Assay() on the LogNormalize "data" layer,
 # because expm1(log1p(y)) == y. Step 02 slims the object to the counts layer, so
 # we reconstruct the normalisation here from counts + nCount_RNA rather than
 # carrying a second matrix through the pipeline.
 #
-# Pass --fc_norm raw to reproduce the previous (upstream) behaviour exactly.
+# On (a) that is a real fix: the fold change no longer tracks sequencing depth.
+# On (b) we now follow Seurat rather than avoid it, because the alternative is
+# worse. Seurat <= 4.x, and upstream get_fc(), add the pseudocount to the MEAN:
+#     log2(mean(counts / nCount_RNA * scale.factor) + pseudocount)
+# With scale.factor = 1e4 a pseudocount of 1 is huge next to a typical gene's
+# mean CP10k, so every effect is crushed toward zero, and the crushing is
+# proportional to expression. Measured on the JL114 900-TF screen, self-knockdown
+# of the target gene, 899 TFs, true pseudobulk knockdown 63.0%:
+#
+#   formula                              median avg_log2FC   implied %KD   rho
+#   mean + 1          (Seurat <= 4.x)         -0.12              8.3      0.33
+#   (sum + 1) / n     (Seurat >= 5.0)         -1.35             60.6      0.99
+#   exact log2 ratio of mean CP10k            -1.43             62.9      1.00
+#
+# rho is Spearman against the exact ratio over the 899 TFs. The old default did
+# not rank effect sizes at all; it ranked expression times effect.
+#
+# The (b) bias is bounded by log2(N_nt / N_pert) and only reaches that bound for
+# a gene with no counts in EITHER group. min.pct and min.cells.group drop those
+# genes, so keep min.pct > 0 (the pipeline default is 0.1) if avg_log2FC is used
+# for ranking or thresholding.
+#
+# Pass --fc_norm log.norm.v4 for the previous mean + pseudocount behaviour, or
+# --fc_norm raw to reproduce upstream Mixscale exactly.
 # A column subset followed by rowSums is a sparse matrix-vector product. The
 # subset only zeroes the columns that were not selected and the Diagonal only
 # rescales the ones that were, and a weight vector that is zero outside `cols`
@@ -174,9 +195,9 @@ compute_fc_stats <- function(counts_mat, p_cols, nt_cols,
 
   # n_expr_* are computed above from the RAW counts; normalisation cannot change
   # which entries are non-zero, so the min.pct / min.cells filters are unaffected.
-  if (identical(norm.method, "log.norm")) {
+  if (norm.method %in% c("log.norm", "log.norm.v4")) {
     if (is.null(total_counts)) {
-      stop("compute_fc_stats(): norm.method='log.norm' requires total_counts.")
+      stop("compute_fc_stats(): norm.method='", norm.method, "' requires total_counts.")
     }
     tp <- as.numeric(total_counts[p_cols])
     tn <- as.numeric(total_counts[nt_cols])
@@ -192,19 +213,33 @@ compute_fc_stats <- function(counts_mat, p_cols, nt_cols,
     tn[!is.finite(tn) | tn <= 0] <- 1
 
     # expm1(LogNormalize(counts)) == counts / nCount_RNA * scale.factor, exactly.
-    mean_P <- log(row_sums_scaled(counts_mat, p_cols,  scale.factor / tp) /
-                    length(p_cols)  + pseudocount.use, base = base)
-    mean_N <- log(row_sums_scaled(counts_mat, nt_cols, scale.factor / tn) /
-                    length(nt_cols) + pseudocount.use, base = base)
+    sum_P <- row_sums_scaled(counts_mat, p_cols,  scale.factor / tp)
+    sum_N <- row_sums_scaled(counts_mat, nt_cols, scale.factor / tn)
+    if (identical(norm.method, "log.norm")) {
+      # Seurat >= 5.0 FoldChange.Assay(): pseudocount on the SUM, i.e. mean + 1/n.
+      mean_P <- log((sum_P + pseudocount.use) / length(p_cols),  base = base)
+      mean_N <- log((sum_N + pseudocount.use) / length(nt_cols), base = base)
+    } else {
+      # Seurat <= 4.x: pseudocount on the MEAN. Kept for reproducing old runs.
+      mean_P <- log(sum_P / length(p_cols)  + pseudocount.use, base = base)
+      mean_N <- log(sum_N / length(nt_cols) + pseudocount.use, base = base)
+    }
   } else if (identical(norm.method, "raw")) {
     mean_P <- log((row_sums_scaled(counts_mat, p_cols,  rep(1, length(p_cols))) +
                      pseudocount.use) / length(p_cols),  base = base)
     mean_N <- log((row_sums_scaled(counts_mat, nt_cols, rep(1, length(nt_cols))) +
                      pseudocount.use) / length(nt_cols), base = base)
   } else {
-    stop("compute_fc_stats(): fc_norm must be 'log.norm' or 'raw', got: ", norm.method)
+    stop("compute_fc_stats(): fc_norm must be 'log.norm', 'log.norm.v4' or 'raw', got: ",
+         norm.method)
   }
   avg_log2FC <- mean_P - mean_N
+
+  # A gene with no counts in EITHER group carries no information, but every
+  # pseudocount-on-the-sum convention (Seurat >= 5.0 and 'raw' alike) reports
+  # log2(N_nt / N_pert) for it. The pipeline defaults are min_pct = 0 and
+  # logfc_threshold = 0, so nothing else would filter it. Report 0.
+  avg_log2FC[n_expr_P == 0 & n_expr_N == 0] <- 0
 
   pass_pct  <- (n_expr_P / length(p_cols)  >= min.pct) |
                (n_expr_N / length(nt_cols) >= min.pct)
